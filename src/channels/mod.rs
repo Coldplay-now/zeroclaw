@@ -5,6 +5,7 @@ pub mod email_channel;
 pub mod imessage;
 pub mod irc;
 pub mod lark;
+pub mod linq;
 pub mod matrix;
 pub mod mattermost;
 pub mod qq;

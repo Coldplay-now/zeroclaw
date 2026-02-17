@@ -1099,16 +1099,20 @@ impl Default for ReliabilityConfig {
 }
 
 // ── Scheduler ────────────────────────────────────────────────────
+//
+// NOTE: The `SchedulerConfig` fields are deprecated and not enforced at runtime.
+// Use `cron.enabled` to control scheduler behavior instead.
+// These fields are kept for backward compatibility but have no effect.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
-    /// Enable the built-in scheduler loop.
+    /// DEPRECATED: Use `cron.enabled` instead. This field has no effect.
     #[serde(default = "default_scheduler_enabled")]
     pub enabled: bool,
-    /// Maximum number of persisted scheduled tasks.
+    /// DEPRECATED: Maximum task limit is not enforced. This field has no effect.
     #[serde(default = "default_scheduler_max_tasks")]
     pub max_tasks: usize,
-    /// Maximum tasks executed per scheduler polling cycle.
+    /// DEPRECATED: Concurrent execution limit is not enforced. This field has no effect.
     #[serde(default = "default_scheduler_max_concurrent")]
     pub max_concurrent: usize,
 }
