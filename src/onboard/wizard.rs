@@ -2426,6 +2426,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         matrix: None,
         signal: None,
         whatsapp: None,
+        linq: None,
         email: None,
         irc: None,
         lark: None,

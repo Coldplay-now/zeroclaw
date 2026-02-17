@@ -249,7 +249,7 @@ impl Tool for HttpRequestTool {
                         if is_sensitive {
                             format!("{}: ***REDACTED***", k.as_str())
                         } else {
-                            format!("{}: {:?}", k.as_str(), v)
+                            format!("{}: {}", k.as_str(), v.to_str().unwrap_or("(invalid UTF-8)"))
                         }
                     })
                     .collect::<Vec<_>>()

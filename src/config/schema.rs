@@ -1285,6 +1285,7 @@ pub struct ChannelsConfig {
     pub matrix: Option<MatrixConfig>,
     pub signal: Option<SignalConfig>,
     pub whatsapp: Option<WhatsAppConfig>,
+    pub linq: Option<LinqConfig>,
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     pub irc: Option<IrcConfig>,
     pub lark: Option<LarkConfig>,
@@ -1305,6 +1306,7 @@ impl Default for ChannelsConfig {
             matrix: None,
             signal: None,
             whatsapp: None,
+            linq: None,
             email: None,
             irc: None,
             lark: None,
@@ -1411,6 +1413,18 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+}
+
+/// Linq unified messaging (iMessage, RCS, SMS) configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinqConfig {
+    /// Linq API key for authentication
+    pub api_key: String,
+    /// Webhook verify token (you define this, Linq sends it back for verification)
+    pub verify_token: String,
+    /// Allowed contacts (phone numbers in E.164 format or email addresses) or "*" for all
+    #[serde(default)]
+    pub allowed_contacts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2319,6 +2333,7 @@ default_temperature = 0.7
                 matrix: None,
                 signal: None,
                 whatsapp: None,
+                linq: None,
                 email: None,
                 irc: None,
                 lark: None,
@@ -2735,6 +2750,7 @@ tool_dispatcher = "xml"
             }),
             signal: None,
             whatsapp: None,
+            linq: None,
             email: None,
             irc: None,
             lark: None,
@@ -2898,6 +2914,7 @@ channel_id = "C123"
                 app_secret: None,
                 allowed_numbers: vec!["+1".into()],
             }),
+            linq: None,
             email: None,
             irc: None,
             lark: None,
@@ -2916,6 +2933,92 @@ channel_id = "C123"
     fn channels_config_default_has_no_whatsapp() {
         let c = ChannelsConfig::default();
         assert!(c.whatsapp.is_none());
+    }
+
+    // ── Linq config ──────────────────────────────────────
+
+    #[test]
+    fn linq_config_serde() {
+        let lc = LinqConfig {
+            api_key: "linq_test_key".into(),
+            verify_token: "my-verify-token".into(),
+            allowed_contacts: vec!["+1234567890".into(), "user@example.com".into()],
+        };
+        let json = serde_json::to_string(&lc).unwrap();
+        let parsed: LinqConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.api_key, "linq_test_key");
+        assert_eq!(parsed.verify_token, "my-verify-token");
+        assert_eq!(parsed.allowed_contacts.len(), 2);
+    }
+
+    #[test]
+    fn linq_config_toml_roundtrip() {
+        let lc = LinqConfig {
+            api_key: "key".into(),
+            verify_token: "verify".into(),
+            allowed_contacts: vec!["+1".into(), "test@example.com".into()],
+        };
+        let toml_str = toml::to_string(&lc).unwrap();
+        let parsed: LinqConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.api_key, "key");
+        assert_eq!(parsed.allowed_contacts, vec!["+1", "test@example.com"]);
+    }
+
+    #[test]
+    fn linq_config_deserializes_without_allowed_contacts() {
+        let json = r#"{"api_key":"key","verify_token":"ver"}"#;
+        let parsed: LinqConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.allowed_contacts.is_empty());
+    }
+
+    #[test]
+    fn linq_config_wildcard_allowed() {
+        let lc = LinqConfig {
+            api_key: "key".into(),
+            verify_token: "ver".into(),
+            allowed_contacts: vec!["*".into()],
+        };
+        let toml_str = toml::to_string(&lc).unwrap();
+        let parsed: LinqConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.allowed_contacts, vec!["*"]);
+    }
+
+    #[test]
+    fn channels_config_with_linq() {
+        let c = ChannelsConfig {
+            cli: true,
+            telegram: None,
+            discord: None,
+            slack: None,
+            mattermost: None,
+            webhook: None,
+            imessage: None,
+            matrix: None,
+            signal: None,
+            whatsapp: None,
+            linq: Some(LinqConfig {
+                api_key: "tok".into(),
+                verify_token: "ver".into(),
+                allowed_contacts: vec!["+1".into(), "user@example.com".into()],
+            }),
+            email: None,
+            irc: None,
+            lark: None,
+            dingtalk: None,
+            qq: None,
+        };
+        let toml_str = toml::to_string_pretty(&c).unwrap();
+        let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.linq.is_some());
+        let lq = parsed.linq.unwrap();
+        assert_eq!(lq.api_key, "tok");
+        assert_eq!(lq.allowed_contacts, vec!["+1", "user@example.com"]);
+    }
+
+    #[test]
+    fn channels_config_default_has_no_linq() {
+        let c = ChannelsConfig::default();
+        assert!(c.linq.is_none());
     }
 
     // ══════════════════════════════════════════════════════════
