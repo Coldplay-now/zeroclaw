@@ -111,13 +111,23 @@ struct NativeResponseMessage {
 
 impl OpenAiProvider {
     pub fn new(credential: Option<&str>) -> Self {
+        Self::new_with_insecure(credential, false)
+    }
+
+    pub fn new_with_insecure(credential: Option<&str>, allow_insecure: bool) -> Self {
+        let mut builder = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10));
+
+        if allow_insecure {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        let client = builder.build().unwrap_or_else(|_| Client::new());
+
         Self {
             credential: credential.map(ToString::to_string),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client,
         }
     }
 

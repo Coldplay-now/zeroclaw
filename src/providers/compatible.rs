@@ -43,18 +43,7 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self {
-            name: name.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            credential: credential.map(ToString::to_string),
-            auth_header: auth_style,
-            supports_responses_fallback: true,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
-        }
+        Self::new_with_insecure(name, base_url, credential, auth_style, false)
     }
 
     /// Same as `new` but skips the /v1/responses fallback on 404.
@@ -65,17 +54,62 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
+        Self::new_no_responses_fallback_with_insecure(name, base_url, credential, auth_style, false)
+    }
+
+    /// Create a new provider with optional insecure HTTPS (self-signed certificates).
+    pub fn new_with_insecure(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        allow_insecure: bool,
+    ) -> Self {
+        let mut builder = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10));
+
+        if allow_insecure {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        let client = builder.build().unwrap_or_else(|_| Client::new());
+
+        Self {
+            name: name.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            credential: credential.map(ToString::to_string),
+            auth_header: auth_style,
+            supports_responses_fallback: true,
+            client,
+        }
+    }
+
+    /// Same as `new_no_responses_fallback` but with optional insecure HTTPS.
+    pub fn new_no_responses_fallback_with_insecure(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        allow_insecure: bool,
+    ) -> Self {
+        let mut builder = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10));
+
+        if allow_insecure {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        let client = builder.build().unwrap_or_else(|_| Client::new());
+
         Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             credential: credential.map(ToString::to_string),
             auth_header: auth_style,
             supports_responses_fallback: false,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client,
         }
     }
 

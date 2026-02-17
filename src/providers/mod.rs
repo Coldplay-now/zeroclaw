@@ -30,6 +30,7 @@ const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+const KIMI_CODE_BASE_URL: &str = "https://api.moonshot.cn/v1";
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
@@ -106,6 +107,13 @@ pub(crate) fn is_zai_alias(name: &str) -> bool {
 
 pub(crate) fn is_qianfan_alias(name: &str) -> bool {
     matches!(name, "qianfan" | "baidu")
+}
+
+pub(crate) fn is_kimicode_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "kimi-code" | "kimicode" | "kimi_code" | "kimi coding" | "kimicoding"
+    )
 }
 
 pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> {
@@ -306,6 +314,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        name if is_kimicode_alias(name) => vec!["KIMI_CODE_API_KEY"],
         _ => vec![],
     };
 
@@ -395,6 +404,12 @@ pub fn create_provider_with_url(
         name if moonshot_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Moonshot",
             moonshot_base_url(name).expect("checked in guard"),
+            key,
+            AuthStyle::Bearer,
+        ))),
+        name if is_kimicode_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Kimi Code",
+            KIMI_CODE_BASE_URL,
             key,
             AuthStyle::Bearer,
         ))),
