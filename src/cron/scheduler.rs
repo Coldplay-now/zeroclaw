@@ -14,6 +14,12 @@ use tokio::time::{self, Duration};
 
 const MIN_POLL_SECONDS: u64 = 5;
 
+/// Maximum bytes of output to persist per cron job run (stdout + stderr).
+const MAX_CRON_OUTPUT_BYTES: usize = 65_536; // 64 KiB
+
+/// Maximum wall-clock time per shell job execution.
+const JOB_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
@@ -385,17 +391,32 @@ async fn run_job_command(
         );
     }
 
-    let output = Command::new("sh")
+    let timeout = Duration::from_secs(JOB_TIMEOUT_SECS);
+    let result = time::timeout(timeout, Command::new("sh")
         .arg("-lc")
         .arg(&job.command)
         .current_dir(&config.workspace_dir)
-        .output()
+        .output())
         .await;
 
-    match output {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+    match result {
+        Ok(Ok(output)) => {
+            // Truncate stdout/stderr to prevent unbounded output growth
+            let truncate = |data: &[u8]| -> String {
+                let byte_limit = MAX_CRON_OUTPUT_BYTES / 2; // Split budget between stdout/stderr
+                if data.len() > byte_limit {
+                    format!(
+                        "{}\n... (truncated, {} bytes total)",
+                        String::from_utf8_lossy(&data[..byte_limit]),
+                        data.len()
+                    )
+                } else {
+                    String::from_utf8_lossy(data).to_string()
+                }
+            };
+
+            let stdout = truncate(&output.stdout);
+            let stderr = truncate(&output.stderr);
             let combined = format!(
                 "status={}\nstdout:\n{}\nstderr:\n{}",
                 output.status,
@@ -404,7 +425,14 @@ async fn run_job_command(
             );
             (output.status.success(), combined)
         }
-        Err(e) => (false, format!("spawn error: {e}")),
+        Ok(Err(e)) => (false, format!("spawn error: {e}")),
+        Err(_) => (
+            false,
+            format!(
+                "job exceeded timeout of {} seconds",
+                JOB_TIMEOUT_SECS
+            )
+        ),
     }
 }
 
@@ -671,5 +699,47 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_times_out_long_running_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["sleep".into()];
+        let job = test_job("sleep 600"); // 10 minutes, but timeout is 5 minutes
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("exceeded timeout"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_truncates_large_output() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["python3".into()];
+        // Generate output larger than MAX_CRON_OUTPUT_BYTES/2 using Python
+        let job = test_job("python3 -c \"print('x' * 40000)\"");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        // Output should be truncated
+        assert!(output.contains("truncated"));
+        assert!(output.contains("bytes total"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_succeeds_within_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["sleep".into()];
+        let job = test_job("sleep 1");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        assert!(output.contains("status=exit status: 0"));
     }
 }

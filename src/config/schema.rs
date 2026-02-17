@@ -757,6 +757,14 @@ pub struct MemoryConfig {
     /// Auto-hydrate from MEMORY_SNAPSHOT.md when brain.db is missing
     #[serde(default = "default_true")]
     pub auto_hydrate: bool,
+
+    // ── SQLite Connection Timeout ────────────────────────────
+    /// Optional timeout in seconds for opening the SQLite database.
+    /// When set, limits how long the process waits when the DB file is
+    /// locked or on slow storage. On timeout, a clear error is returned.
+    /// None means wait indefinitely (current behavior). Capped at 300 seconds.
+    #[serde(default)]
+    pub sqlite_open_timeout_secs: Option<u64>,
 }
 
 fn default_embedding_provider() -> String {
@@ -821,6 +829,7 @@ impl Default for MemoryConfig {
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,
+            sqlite_open_timeout_secs: None,
         }
     }
 }
