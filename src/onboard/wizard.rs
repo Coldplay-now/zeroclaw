@@ -136,6 +136,7 @@ pub fn run_wizard() -> Result<Config> {
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
+        web: crate::config::WebConfig::default(),
     };
 
     println!(
@@ -351,10 +352,12 @@ pub fn run_quick_setup(
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
+<<<<<<< HEAD
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
+        web: crate::config::WebConfig::default(),
     };
 
     config.save()?;

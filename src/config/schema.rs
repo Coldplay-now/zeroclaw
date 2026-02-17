@@ -93,6 +93,10 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// Web chat UI configuration.
+    #[serde(default)]
+    pub web: WebConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -663,6 +667,51 @@ impl Default for BrowserConfig {
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
+        }
+    }
+}
+
+// ── Web (browser-based chat UI) ───────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebConfig {
+    /// Enable the web chat UI
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address (default: "127.0.0.1:8080")
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+    /// Bearer token for auth (empty = no auth)
+    #[serde(default)]
+    pub auth_token: String,
+    /// Maximum concurrent sessions
+    #[serde(default = "default_web_max_sessions")]
+    pub max_sessions: usize,
+    /// Session timeout in seconds
+    #[serde(default = "default_web_session_timeout")]
+    pub session_timeout_secs: u64,
+}
+
+fn default_web_bind() -> String {
+    "127.0.0.1:8080".into()
+}
+
+fn default_web_max_sessions() -> usize {
+    10
+}
+
+fn default_web_session_timeout() -> u64 {
+    3600
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_web_bind(),
+            auth_token: String::new(),
+            max_sessions: default_web_max_sessions(),
+            session_timeout_secs: default_web_session_timeout(),
         }
     }
 }
@@ -1727,6 +1776,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            web: WebConfig::default(),
         }
     }
 }
@@ -2366,6 +2416,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            web: WebConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2475,6 +2526,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            web: WebConfig::default(),
         };
 
         config.save().unwrap();
