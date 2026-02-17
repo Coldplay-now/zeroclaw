@@ -74,7 +74,10 @@ struct ChannelRuntimeContext {
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
+    // Use reply_target (chat_id for Telegram, channel_id for Discord, etc.)
+    // instead of msg.id to group messages by conversation thread.
+    // This maintains context across all messages in the same chat.
+    format!("{}_{}_{}", msg.channel, msg.sender, msg.reply_target)
 }
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
@@ -1906,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_memory_key_uses_message_id() {
+    fn conversation_memory_key_uses_reply_target() {
         let msg = traits::ChannelMessage {
             id: "msg_abc123".into(),
             sender: "U123".into(),
@@ -1916,11 +1919,11 @@ mod tests {
             timestamp: 1,
         };
 
-        assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+        assert_eq!(conversation_memory_key(&msg), "slack_U123_C456");
     }
 
     #[test]
-    fn conversation_memory_key_is_unique_per_message() {
+    fn conversation_memory_key_groups_by_conversation() {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
@@ -1938,7 +1941,8 @@ mod tests {
             timestamp: 2,
         };
 
-        assert_ne!(
+        // Same conversation (same reply_target) should have the same key
+        assert_eq!(
             conversation_memory_key(&msg1),
             conversation_memory_key(&msg2)
         );
@@ -1960,7 +1964,7 @@ mod tests {
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
             sender: "U123".into(),
-            reply_target: "C456".into(),
+            reply_target: "C789".into(),  // Different conversation
             content: "I'm 45".into(),
             channel: "slack".into(),
             timestamp: 2,
@@ -1983,10 +1987,69 @@ mod tests {
         .await
         .unwrap();
 
+        // Two different conversations should have two entries
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5, None).await.unwrap();
-        assert!(recalled.iter().any(|entry| entry.content.contains("45")));
+        // Both entries should be recallable
+        let recalled_paul = mem.recall("Paul", 5, None).await.unwrap();
+        assert!(recalled_paul.iter().any(|entry| entry.content.contains("Paul")));
+
+        let recalled_age = mem.recall("45", 5, None).await.unwrap();
+        assert!(recalled_age.iter().any(|entry| entry.content.contains("45")));
+    }
+
+    #[test]
+    fn telegram_messages_in_same_chat_share_conversation_key() {
+        // Test for issue #620: context loss on every message in telegram
+        let msg1 = traits::ChannelMessage {
+            id: "telegram_-100200300_33".into(),
+            sender: "alice".into(),
+            reply_target: "-100200300".into(),  // chat_id
+            content: "first message".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "telegram_-100200300_34".into(),
+            sender: "alice".into(),
+            reply_target: "-100200300".into(),  // same chat_id
+            content: "second message".into(),
+            channel: "telegram".into(),
+            timestamp: 2,
+        };
+
+        // Messages in the same chat should have the same conversation key
+        assert_eq!(
+            conversation_memory_key(&msg1),
+            conversation_memory_key(&msg2)
+        );
+        assert_eq!(conversation_memory_key(&msg1), "telegram_alice_-100200300");
+    }
+
+    #[test]
+    fn telegram_messages_in_different_chats_have_different_keys() {
+        let msg1 = traits::ChannelMessage {
+            id: "telegram_-100200300_33".into(),
+            sender: "alice".into(),
+            reply_target: "-100200300".into(),
+            content: "chat 1 message".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "telegram_-100400500_44".into(),
+            sender: "alice".into(),
+            reply_target: "-100400500".into(),  // different chat_id
+            content: "chat 2 message".into(),
+            channel: "telegram".into(),
+            timestamp: 2,
+        };
+
+        // Messages in different chats should have different keys
+        assert_ne!(
+            conversation_memory_key(&msg1),
+            conversation_memory_key(&msg2)
+        );
     }
 
     #[tokio::test]

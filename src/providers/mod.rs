@@ -737,6 +737,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "kimi-code",
+            display_name: "Kimi Code",
+            aliases: &["kimicode", "kimi_code", "kimicoding"],
+            local: false,
+        },
+        ProviderInfo {
             name: "synthetic",
             display_name: "Synthetic",
             aliases: &[],
@@ -883,6 +889,15 @@ mod tests {
         assert!(is_zai_alias("zai-cn"));
         assert!(is_qianfan_alias("qianfan"));
         assert!(is_qianfan_alias("baidu"));
+        assert!(is_kimicode_alias("kimi-code"));
+        assert!(is_kimicode_alias("kimicode"));
+        assert!(is_kimicode_alias("kimi_code"));
+
+        // Kimi Code is separate from Moonshot/Kimi
+        assert!(!is_kimicode_alias("moonshot"));
+        assert!(!is_kimicode_alias("kimi"));
+        assert!(!is_kimicode_alias("kimi-cn"));
+        assert!(!is_moonshot_alias("kimi-code"));
 
         assert!(!is_moonshot_alias("openrouter"));
         assert!(!is_glm_alias("openai"));
@@ -1054,6 +1069,15 @@ mod tests {
     fn factory_qianfan() {
         assert!(create_provider("qianfan", Some("key")).is_ok());
         assert!(create_provider("baidu", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_kimicode() {
+        assert!(create_provider("kimi-code", Some("key")).is_ok());
+        assert!(create_provider("kimicode", Some("key")).is_ok());
+        assert!(create_provider("kimi_code", Some("key")).is_ok());
+        assert!(create_provider("kimi coding", Some("key")).is_ok());
+        assert!(create_provider("kimicoding", Some("key")).is_ok());
     }
 
     #[test]

@@ -503,7 +503,10 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
+        // Can be blocked at is_command_allowed level (issue #597) or forbidden_path_argument level
+        assert!(
+            output.contains("forbidden path argument") || output.contains("command not allowed")
+        );
         assert!(output.contains("/etc/passwd"));
     }
 
