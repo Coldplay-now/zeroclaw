@@ -6,6 +6,48 @@ use std::process::Command;
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 
+/// Init system detection for Linux
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitSystem {
+    Systemd,
+    OpenRC,
+    Unknown,
+}
+
+/// Detect which init system is active on the system
+fn detect_init_system() -> InitSystem {
+    // Check for systemd first (most common)
+    if Command::new("systemctl")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return InitSystem::Systemd;
+    }
+
+    // Check for OpenRC (Alpine Linux, Gentoo, etc.)
+    if Command::new("rc-status")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return InitSystem::OpenRC;
+    }
+
+    // Check for /sbin/openrc as a fallback
+    if Command::new("/sbin/openrc")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return InitSystem::OpenRC;
+    }
+
+    InitSystem::Unknown
+}
+
 pub fn handle_command(command: &crate::ServiceCommands, config: &Config) -> Result<()> {
     match command {
         crate::ServiceCommands::Install => install(config),
@@ -34,10 +76,27 @@ fn start(config: &Config) -> Result<()> {
         println!("✅ Service started");
         Ok(())
     } else if cfg!(target_os = "linux") {
-        run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-        run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]))?;
-        println!("✅ Service started");
-        Ok(())
+        let init_system = detect_init_system();
+        match init_system {
+            InitSystem::Systemd => {
+                run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+                run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]))?;
+                println!("✅ Service started");
+                return Ok(());
+            }
+            InitSystem::OpenRC => {
+                run_checked(Command::new("rc-service").arg("zeroclaw").arg("start"))?;
+                println!("✅ Service started");
+                return Ok(());
+            }
+            InitSystem::Unknown => {
+                // Try systemd as fallback
+                let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
+                let _ = run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]));
+                println!("✅ Service started (systemd)");
+                return Ok(());
+            }
+        }
     } else {
         let _ = config;
         anyhow::bail!("Service management is supported on macOS and Linux only")
@@ -57,9 +116,24 @@ fn stop(config: &Config) -> Result<()> {
         println!("✅ Service stopped");
         Ok(())
     } else if cfg!(target_os = "linux") {
-        let _ = run_checked(Command::new("systemctl").args(["--user", "stop", "zeroclaw.service"]));
-        println!("✅ Service stopped");
-        Ok(())
+        let init_system = detect_init_system();
+        match init_system {
+            InitSystem::Systemd => {
+                let _ = run_checked(Command::new("systemctl").args(["--user", "stop", "zeroclaw.service"]));
+                println!("✅ Service stopped");
+                return Ok(());
+            }
+            InitSystem::OpenRC => {
+                run_checked(Command::new("rc-service").arg("zeroclaw").arg("stop"))?;
+                println!("✅ Service stopped");
+                return Ok(());
+            }
+            InitSystem::Unknown => {
+                let _ = run_checked(Command::new("systemctl").args(["--user", "stop", "zeroclaw.service"]));
+                println!("✅ Service stopped (systemd)");
+                return Ok(());
+            }
+        }
     } else {
         let _ = config;
         anyhow::bail!("Service management is supported on macOS and Linux only")
@@ -83,15 +157,40 @@ fn status(config: &Config) -> Result<()> {
     }
 
     if cfg!(target_os = "linux") {
-        let out = run_capture(Command::new("systemctl").args([
-            "--user",
-            "is-active",
-            "zeroclaw.service",
-        ]))
-        .unwrap_or_else(|_| "unknown".into());
-        println!("Service state: {}", out.trim());
-        println!("Unit: {}", linux_service_file(config)?.display());
-        return Ok(());
+        let init_system = detect_init_system();
+        match init_system {
+            InitSystem::Systemd => {
+                let out = run_capture(Command::new("systemctl").args([
+                    "--user",
+                    "is-active",
+                    "zeroclaw.service",
+                ]))
+                .unwrap_or_else(|_| "unknown".into());
+                println!("Init system: systemd");
+                println!("Service state: {}", out.trim());
+                println!("Unit: {}", linux_service_file(config)?.display());
+                return Ok(());
+            }
+            InitSystem::OpenRC => {
+                let out = run_capture(Command::new("rc-service").arg("zeroclaw").arg("status"))
+                    .unwrap_or_else(|_| "unknown".into());
+                println!("Init system: OpenRC");
+                println!("Service state: {}", out.trim());
+                println!("Script: {}", openrc_service_file(config)?.display());
+                return Ok(());
+            }
+            InitSystem::Unknown => {
+                println!("Init system: unknown (trying systemd)");
+                let out = run_capture(Command::new("systemctl").args([
+                    "--user",
+                    "is-active",
+                    "zeroclaw.service",
+                ]))
+                .unwrap_or_else(|_| "unknown".into());
+                println!("Service state: {}", out.trim());
+                return Ok(());
+            }
+        }
     }
 
     anyhow::bail!("Service management is supported on macOS and Linux only")
@@ -111,14 +210,40 @@ fn uninstall(config: &Config) -> Result<()> {
     }
 
     if cfg!(target_os = "linux") {
-        let file = linux_service_file(config)?;
-        if file.exists() {
-            fs::remove_file(&file)
-                .with_context(|| format!("Failed to remove {}", file.display()))?;
+        let init_system = detect_init_system();
+        match init_system {
+            InitSystem::Systemd => {
+                let file = linux_service_file(config)?;
+                if file.exists() {
+                    fs::remove_file(&file)
+                        .with_context(|| format!("Failed to remove {}", file.display()))?;
+                }
+                let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
+                println!("✅ Service uninstalled ({})", file.display());
+                return Ok(());
+            }
+            InitSystem::OpenRC => {
+                let file = openrc_service_file(config)?;
+                // Disable the service first
+                let _ = run_checked(Command::new("rc-update").arg("delete").arg("zeroclaw").arg("default"));
+                if file.exists() {
+                    fs::remove_file(&file)
+                        .with_context(|| format!("Failed to remove {}", file.display()))?;
+                }
+                println!("✅ Service uninstalled ({})", file.display());
+                return Ok(());
+            }
+            InitSystem::Unknown => {
+                let file = linux_service_file(config)?;
+                if file.exists() {
+                    fs::remove_file(&file)
+                        .with_context(|| format!("Failed to remove {}", file.display()))?;
+                }
+                let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
+                println!("✅ Service uninstalled ({})", file.display());
+                return Ok(());
+            }
         }
-        let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-        println!("✅ Service uninstalled ({})", file.display());
-        return Ok(());
     }
 
     anyhow::bail!("Service management is supported on macOS and Linux only")
@@ -177,6 +302,20 @@ fn install_macos(config: &Config) -> Result<()> {
 }
 
 fn install_linux(config: &Config) -> Result<()> {
+    let init_system = detect_init_system();
+
+    match init_system {
+        InitSystem::Systemd => install_systemd(config),
+        InitSystem::OpenRC => install_openrc(config),
+        InitSystem::Unknown => {
+            // Fallback to systemd for unknown systems (may work in user sessions)
+            eprintln!("⚠️  Could not detect init system, trying systemd...");
+            install_systemd(config)
+        }
+    }
+}
+
+fn install_systemd(config: &Config) -> Result<()> {
     let file = linux_service_file(config)?;
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent)?;
@@ -193,6 +332,58 @@ fn install_linux(config: &Config) -> Result<()> {
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
     println!("   Start with: zeroclaw service start");
+    Ok(())
+}
+
+fn install_openrc(config: &Config) -> Result<()> {
+    let file = openrc_service_file(config)?;
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+
+    // OpenRC init script
+    let init_script = format!(
+        r#"#!/sbin/openrc-run
+
+description="ZeroClaw AI assistant daemon"
+command="{exe}"
+command_args="daemon"
+command_background=true
+pidfile="/run/$RC_SVCNAME.pid"
+output_log="/var/log/zeroclaw/daemon.log"
+error_log="/var/log/zeroclaw/daemon.error.log"
+
+depend() {{
+    need net
+    after firewall
+}}
+
+start_pre() {{
+    checkpath --directory --owner root:root --mode 0755 /var/log/zeroclaw
+}}
+"#,
+        exe = exe.display()
+    );
+
+    fs::write(&file, init_script)?;
+
+    // Make the script executable
+    let mut perms = fs::metadata(&file)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        fs::set_permissions(&file, perms)?;
+    }
+
+    // Enable the service (add to default runlevel)
+    let _ = run_checked(Command::new("rc-update").arg("add").arg("zeroclaw").arg("default"));
+
+    println!("✅ Installed OpenRC service: {}", file.display());
+    println!("   Start with: zeroclaw service start");
+    println!("   Or: rc-service zeroclaw start");
     Ok(())
 }
 
@@ -216,6 +407,26 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
         .join("systemd")
         .join("user")
         .join("zeroclaw.service"))
+}
+
+fn openrc_service_file(config: &Config) -> Result<PathBuf> {
+    let _ = config;
+    // OpenRC init scripts are typically in /etc/init.d/ or /etc/local.d/
+    // For user-managed services, we use /etc/init.d/ for system-wide or
+    // ~/.local/init.d/ for user-local (less common)
+    // We'll use /etc/init.d/ which requires root, or fall back to ~/.local/init.d/
+    if PathBuf::from("/etc/init.d").exists() && std::env::var("USER").ok().as_deref() == Some("root") {
+        Ok(PathBuf::from("/etc/init.d/zeroclaw"))
+    } else {
+        // For non-root users, use a local init directory
+        let home = directories::UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .context("Could not find home directory")?;
+        Ok(home
+            .join(".local")
+            .join("init.d")
+            .join("zeroclaw"))
+    }
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -280,5 +491,13 @@ mod tests {
         let file = linux_service_file(&Config::default()).unwrap();
         let path = file.to_string_lossy();
         assert!(path.ends_with(".config/systemd/user/zeroclaw.service"));
+    }
+
+    #[test]
+    fn openrc_service_file_has_expected_suffix() {
+        let file = openrc_service_file(&Config::default()).unwrap();
+        let path = file.to_string_lossy();
+        // For non-root users, should be in ~/.local/init.d/
+        assert!(path.contains(".local/init.d/zeroclaw") || path.contains("/etc/init.d/zeroclaw"));
     }
 }

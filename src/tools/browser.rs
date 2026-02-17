@@ -423,6 +423,28 @@ impl BrowserTool {
         Ok(())
     }
 
+    /// Validate the current browser URL against allowlist.
+    /// Call this after actions that may cause navigation (click, fill, type, press).
+    #[cfg(feature = "browser-native")]
+    async fn validate_current_url(&self, client: &Client) -> anyhow::Result<()> {
+        let url = client
+            .current_url()
+            .await
+            .context("Failed to read current URL for allowlist validation")?;
+        self.validate_url(url.as_str())
+    }
+
+    /// Validate the current browser URL against allowlist for agent-browser backend.
+    async fn validate_current_url_agent_browser(&self) -> anyhow::Result<()> {
+        let resp = self.run_command(&["get", "--field", "url"]).await?;
+        // Extract URL as owned String to avoid lifetime issues with the borrow chain
+        let current_url = resp
+            .data
+            .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from))
+            .ok_or_else(|| anyhow::anyhow!("Failed to extract current URL from agent-browser response"))?;
+        self.validate_url(&current_url)
+    }
+
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
         let mut cmd = Command::new("agent-browser");
@@ -1130,6 +1152,8 @@ mod native_backend {
                 BrowserAction::Click { selector } => {
                     let client = self.active_client()?;
                     find_element(client, &selector).await?.click().await?;
+                    // Re-validate URL after navigation-capable action
+                    self.validate_current_url(client).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1142,6 +1166,8 @@ mod native_backend {
                     let element = find_element(client, &selector).await?;
                     let _ = element.clear().await;
                     element.send_keys(&value).await?;
+                    // Re-validate URL after navigation-capable action (form submits can navigate)
+                    self.validate_current_url(client).await?;
 
                     Ok(json!({
                         "backend": "rust_native",

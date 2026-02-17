@@ -53,7 +53,7 @@ impl GitOperationsTool {
     fn requires_write_access(&self, operation: &str) -> bool {
         matches!(
             operation,
-            "commit" | "add" | "checkout" | "branch" | "stash" | "reset" | "revert"
+            "commit" | "add" | "checkout" | "stash" | "reset" | "revert"
         )
     }
 
@@ -765,5 +765,203 @@ mod tests {
         let truncated = GitOperationsTool::truncate_commit_message(&long);
 
         assert_eq!(truncated.chars().count(), 2000);
+    }
+
+    // ── Policy classification tests (issue #612) ─────────────────────
+
+    #[test]
+    fn branch_is_read_only() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // branch listing should be classified as read-only
+        assert!(tool.is_read_only("branch"));
+    }
+
+    #[test]
+    fn branch_does_not_require_write_access() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // branch listing should NOT require write access
+        assert!(!tool.requires_write_access("branch"));
+    }
+
+    #[test]
+    fn write_operations_require_write_access() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // These operations should require write access
+        assert!(tool.requires_write_access("commit"));
+        assert!(tool.requires_write_access("add"));
+        assert!(tool.requires_write_access("checkout"));
+        assert!(tool.requires_write_access("stash"));
+        assert!(tool.requires_write_access("reset"));
+        assert!(tool.requires_write_access("revert"));
+    }
+
+    #[test]
+    fn read_only_operations_are_read_only() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // These operations should be classified as read-only
+        assert!(tool.is_read_only("status"));
+        assert!(tool.is_read_only("diff"));
+        assert!(tool.is_read_only("log"));
+        assert!(tool.is_read_only("branch"));
+        assert!(tool.is_read_only("rev-parse"));
+    }
+
+    #[test]
+    fn write_operations_are_not_read_only() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // Write operations should NOT be classified as read-only
+        assert!(!tool.is_read_only("commit"));
+        assert!(!tool.is_read_only("add"));
+        assert!(!tool.is_read_only("checkout"));
+        assert!(!tool.is_read_only("stash"));
+        assert!(!tool.is_read_only("reset"));
+        assert!(!tool.is_read_only("revert"));
+    }
+
+    #[tokio::test]
+    async fn branch_listing_allowed_in_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        // Initialize a git repository
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        // Branch listing should NOT be blocked by read-only mode
+        let result = tool.execute(json!({"operation": "branch"})).await.unwrap();
+        // Should succeed (with empty branch list) since we're in a fresh repo
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn status_allowed_in_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        // Initialize a git repository
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        // Status should be allowed in read-only mode
+        let result = tool.execute(json!({"operation": "status"})).await.unwrap();
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn log_allowed_in_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        // Initialize a git repository
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        // Make an initial commit so log has something to show
+        std::fs::write(tmp.path().join("test.txt"), "test").unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "test.txt"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        // Log should be allowed in read-only mode
+        let result = tool.execute(json!({"operation": "log"})).await.unwrap();
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn diff_allowed_in_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        // Initialize a git repository
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        // Diff should be allowed in read-only mode
+        let result = tool.execute(json!({"operation": "diff"})).await.unwrap();
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn commit_blocked_in_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        // Initialize a git repository
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        // Commit should be blocked in read-only mode
+        let result = tool
+            .execute(json!({"operation": "commit", "message": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("higher autonomy"));
     }
 }
