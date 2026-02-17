@@ -36,7 +36,7 @@ FROM busybox:1.37@sha256:b3255e7dfbcd10cb367af0d409747d511aeb66dfac98cf30e97e87e
 # Create directory structure (simplified workspace path)
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace
 
-# Create minimal config for PRODUCTION (allows binding to public interfaces)
+# Create minimal config for PRODUCTION (localhost-only for security)
 # NOTE: Provider configuration must be done via environment variables at runtime
 RUN cat > /zeroclaw-data/.zeroclaw/config.toml <<EOF
 workspace_dir = "/zeroclaw-data/workspace"
@@ -48,8 +48,8 @@ default_temperature = 0.7
 
 [gateway]
 port = 3000
-host = "[::]"
-allow_public_bind = true
+host = "127.0.0.1"
+allow_public_bind = false
 EOF
 
 RUN chown -R 65534:65534 /zeroclaw-data
@@ -90,7 +90,7 @@ WORKDIR /zeroclaw-data
 USER 65534:65534
 EXPOSE 3000
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway", "--port", "3000", "--host", "[::]"]
+CMD ["gateway", "--port", "3000", "--host", "127.0.0.1"]
 
 # ── Stage 4: Production Runtime (Distroless) ─────────────────
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
@@ -112,4 +112,4 @@ WORKDIR /zeroclaw-data
 USER 65534:65534
 EXPOSE 3000
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway", "--port", "3000", "--host", "[::]"]
+CMD ["gateway", "--port", "3000", "--host", "127.0.0.1"]

@@ -530,16 +530,19 @@ impl BrowserTool {
 
             BrowserAction::Click { selector } => {
                 let resp = self.run_command(&["click", &selector]).await?;
+                self.validate_current_url_agent_browser().await?;
                 self.to_result(resp)
             }
 
             BrowserAction::Fill { selector, value } => {
                 let resp = self.run_command(&["fill", &selector, &value]).await?;
+                self.validate_current_url_agent_browser().await?;
                 self.to_result(resp)
             }
 
             BrowserAction::Type { selector, text } => {
                 let resp = self.run_command(&["type", &selector, &text]).await?;
+                self.validate_current_url_agent_browser().await?;
                 self.to_result(resp)
             }
 
@@ -560,8 +563,20 @@ impl BrowserTool {
 
             BrowserAction::Screenshot { path, full_page } => {
                 let mut args = vec!["screenshot"];
+                // Security check: validate screenshot path is within workspace
+                let path_str;
                 if let Some(ref p) = path {
-                    args.push(p);
+                    if !self.security.is_path_allowed(p) {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Screenshot path not allowed by security policy: {p}")),
+                        });
+                    }
+                    // Resolve to workspace-relative path for agent-browser
+                    let full_path = self.security.workspace_dir.join(p);
+                    path_str = full_path.to_str().map(String::from).unwrap_or_else(|| p.to_string());
+                    args.push(&path_str);
                 }
                 if full_page {
                     args.push("--full");
@@ -588,6 +603,7 @@ impl BrowserTool {
 
             BrowserAction::Press { key } => {
                 let resp = self.run_command(&["press", &key]).await?;
+                self.validate_current_url_agent_browser().await?;
                 self.to_result(resp)
             }
 
@@ -1181,6 +1197,8 @@ mod native_backend {
                         .await?
                         .send_keys(&text)
                         .await?;
+                    // Re-validate URL after navigation-capable action (can trigger form submits or other navigation)
+                    self.validate_current_url(client).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1237,7 +1255,17 @@ mod native_backend {
                     });
 
                     if let Some(path_str) = path {
-                        std::fs::write(&path_str, &png)
+                        // Security check: validate screenshot path is within workspace
+                        if !self.security.is_path_allowed(&path_str) {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Screenshot path not allowed by security policy: {path_str}")),
+                            });
+                        }
+                        // Resolve to workspace-relative path
+                        let full_path = self.security.workspace_dir.join(&path_str);
+                        std::fs::write(&full_path, &png)
                             .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
                         payload["path"] = Value::String(path_str);
                     } else {
@@ -1300,6 +1328,8 @@ mod native_backend {
                                 .await?;
                         }
                     }
+                    // Re-validate URL after navigation-capable action (Enter can trigger navigation)
+                    self.validate_current_url(client).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1383,6 +1413,8 @@ mod native_backend {
                     let payload = match action.as_str() {
                         "click" => {
                             element.click().await?;
+                            // Re-validate URL after navigation-capable action
+                            self.validate_current_url(client).await?;
                             json!({"result": "clicked"})
                         }
                         "fill" => {
@@ -1391,6 +1423,8 @@ mod native_backend {
                             })?;
                             let _ = element.clear().await;
                             element.send_keys(&fill).await?;
+                            // Re-validate URL after navigation-capable action (form submits can navigate)
+                            self.validate_current_url(client).await?;
                             json!({"result": "filled", "typed": fill.len()})
                         }
                         "text" => {
@@ -1405,6 +1439,8 @@ mod native_backend {
                             let checked_before = element_checked(&element).await?;
                             if !checked_before {
                                 element.click().await?;
+                                // Re-validate URL after navigation-capable action
+                                self.validate_current_url(client).await?;
                             }
                             let checked_after = element_checked(&element).await?;
                             json!({
