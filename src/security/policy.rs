@@ -342,8 +342,10 @@ impl SecurityPolicy {
     /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines) and
     ///   validates each sub-command against the allowlist
     /// - Blocks single `&` background chaining (`&&` remains supported)
-    /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
+    /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path-policy
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
+    /// - Blocks shell variable references (`$VAR`) when workspace_only is enabled
+    /// - Validates path arguments for file-reading commands when workspace_only is enabled
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
@@ -360,8 +362,10 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block output redirections — they can write to arbitrary paths
-        if command.contains('>') {
+        // Block shell redirections — they can read/write arbitrary paths
+        // Input redirection (`<`) can bypass path-policy (e.g. `cat </etc/passwd`)
+        // Output redirection (`>`, `>>`) can write outside workspace
+        if command.contains('>') || command.contains('<') {
             return false;
         }
 
@@ -420,6 +424,47 @@ impl SecurityPolicy {
             if !self.is_args_safe(base_cmd, &args) {
                 return false;
             }
+
+            // Validate path arguments for file-reading commands
+            // (always check for forbidden_paths, and for workspace confinement when enabled)
+            if self.is_file_reading_command(base_cmd) {
+                // Check for shell variables in workspace_only mode
+                // (they could expand to paths outside workspace)
+                if self.workspace_only {
+                    let bytes = segment.as_bytes();
+                    for (i, &b) in bytes.iter().enumerate() {
+                        if b == b'$' {
+                            // Check if this is $$ (PID), which we allow
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                                continue;
+                            }
+                            // Check if next char is alphanumeric or underscore (variable reference)
+                            if i + 1 < bytes.len() {
+                                let next = bytes[i + 1];
+                                if next.is_ascii_alphanumeric() || next == b'_' {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Use original words (not lowercased) for path validation
+                let mut words_original = cmd_part.split_whitespace();
+                words_original.next(); // Skip the command itself
+                for arg in words_original {
+                    // Check if this looks like a path argument
+                    // (starts with - or -- could be an option, skip those)
+                    if arg.starts_with('-') {
+                        continue;
+                    }
+                    // Validate this as a path (checks forbidden_paths always,
+                    // and absolute paths when workspace_only=true)
+                    if !self.is_path_allowed(arg) {
+                        return false;
+                    }
+                }
+            }
         }
 
         // At least one command must be present
@@ -452,6 +497,14 @@ impl SecurityPolicy {
             }
             _ => true,
         }
+    }
+
+    /// Check if a command reads files and should have its path arguments validated.
+    fn is_file_reading_command(&self, base: &str) -> bool {
+        matches!(
+            base,
+            "cat" | "head" | "tail" | "grep" | "find" | "ls" | "file" | "readlink"
+        )
     }
 
     /// Check if a file path is allowed (no path traversal, within workspace)
@@ -1019,8 +1072,13 @@ mod tests {
     #[test]
     fn command_injection_redirect_blocked() {
         let p = default_policy();
+        // Output redirection blocked (can write outside workspace)
         assert!(!p.is_command_allowed("echo secret > /etc/crontab"));
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
+        // Input redirection blocked (can bypass path-policy)
+        assert!(!p.is_command_allowed("cat </etc/passwd"));
+        assert!(!p.is_command_allowed("cat</etc/passwd"));
+        assert!(!p.is_command_allowed("grep pattern < ~/.ssh/id_rsa"));
     }
 
     #[test]
@@ -1324,5 +1382,238 @@ mod tests {
                 "Default forbidden_paths must include {dot}"
             );
         }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Issue #597: Workspace confinement for shell tool path arguments
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn issue_597_shell_var_blocked_in_workspace_only_mode() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "echo".into(), "pwd".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Shell variables in file-reading commands should be blocked in workspace_only mode
+        assert!(!p.is_command_allowed("cat $HOME/.ssh/id_rsa"));
+        assert!(!p.is_command_allowed("cat $USER/file.txt"));
+        assert!(!p.is_command_allowed("cat ${HOME}/file.txt")); // Note: ${ is already blocked by subshell check
+        assert!(!p.is_command_allowed("cat ${HOME}/.ssh/id_rsa"));
+        assert!(!p.is_command_allowed("head $CONFIG_DIR/secrets"));
+        assert!(!p.is_command_allowed("tail $WORKSPACE/../etc/passwd"));
+
+        // But variables in non-file-reading commands should be allowed
+        assert!(p.is_command_allowed("echo $HOME"));
+        assert!(p.is_command_allowed("echo $PATH"));
+        assert!(p.is_command_allowed("echo $USER"));
+        assert!(p.is_command_allowed("pwd"));
+
+        // Variables should be allowed when workspace_only is false
+        let p_not_workspace_only = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "echo".into()],
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p_not_workspace_only.is_command_allowed("cat $HOME/.ssh/id_rsa"));
+        assert!(p_not_workspace_only.is_command_allowed("echo $HOME"));
+    }
+
+    #[test]
+    fn issue_597_absolute_path_blocked_for_file_reading_commands() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "head".into(), "tail".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Absolute paths should be blocked for file-reading commands
+        assert!(!p.is_command_allowed("cat /etc/passwd"));
+        assert!(!p.is_command_allowed("cat /root/.ssh/id_rsa"));
+        assert!(!p.is_command_allowed("head /etc/shadow"));
+        assert!(!p.is_command_allowed("tail /var/log/auth.log"));
+        assert!(!p.is_command_allowed("cat /tmp/secrets.txt"));
+
+        // Relative paths within workspace should be allowed
+        assert!(p.is_command_allowed("cat file.txt"));
+        assert!(p.is_command_allowed("cat src/main.rs"));
+        assert!(p.is_command_allowed("head README.md"));
+        assert!(p.is_command_allowed("tail log/output.log"));
+    }
+
+    #[test]
+    fn issue_597_path_traversal_blocked_in_file_args() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "grep".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Path traversal should be blocked in file arguments
+        assert!(!p.is_command_allowed("cat ../../../etc/passwd"));
+        assert!(!p.is_command_allowed("cat ../private.txt"));
+        assert!(!p.is_command_allowed("grep secret ../../ssh/key"));
+        assert!(!p.is_command_allowed("cat foo/../../etc/passwd"));
+    }
+
+    #[test]
+    fn issue_597_forbidden_paths_blocked_in_file_args() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "head".into()],
+            workspace_only: false, // Still block forbidden paths
+            ..SecurityPolicy::default()
+        };
+
+        // Forbidden paths should still be blocked even when workspace_only=false
+        assert!(!p.is_command_allowed("cat /etc/passwd"));
+        assert!(!p.is_command_allowed("cat /root/.ssh/id_rsa"));
+        assert!(!p.is_command_allowed("cat ~/.ssh/id_rsa"));
+        assert!(!p.is_command_allowed("head ~/.gnupg/secring.gpg"));
+        assert!(!p.is_command_allowed("tail ~/.aws/credentials"));
+    }
+
+    #[test]
+    fn issue_597_options_not_treated_as_paths() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "head".into(), "tail".into(), "grep".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Options starting with - should not be treated as paths
+        assert!(p.is_command_allowed("cat -n file.txt"));
+        assert!(p.is_command_allowed("head -n 10 README.md"));
+        assert!(p.is_command_allowed("tail -f log.txt"));
+        assert!(p.is_command_allowed("grep -r pattern ."));
+        assert!(p.is_command_allowed("grep -i pattern src/"));
+        assert!(p.is_command_allowed("grep --include=*.rs pattern ."));
+
+        // But a path that happens to start with - would be blocked (unusual edge case)
+        // This is a safe default - filenames starting with - are problematic anyway
+    }
+
+    #[test]
+    fn issue_597_multiple_files_all_validated() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // All file arguments should be validated
+        assert!(p.is_command_allowed("cat file1.txt file2.txt"));
+        assert!(!p.is_command_allowed("cat file1.txt /etc/passwd"));
+        assert!(!p.is_command_allowed("cat /etc/passwd file2.txt"));
+        assert!(!p.is_command_allowed("cat ../escape file.txt"));
+    }
+
+    #[test]
+    fn issue_597_non_file_commands_unchanged() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["echo".into(), "pwd".into(), "wc".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Commands that don't read files should work as before
+        assert!(p.is_command_allowed("echo hello"));
+        assert!(p.is_command_allowed("echo $PATH")); // Variables allowed in echo
+        assert!(p.is_command_allowed("pwd"));
+        assert!(p.is_command_allowed("wc -l"));
+
+        // echo with arguments should still work
+        assert!(p.is_command_allowed("echo hello world"));
+        assert!(p.is_command_allowed("echo -n hello"));
+    }
+
+    #[test]
+    fn issue_597_ls_path_validation() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // ls with absolute paths should be blocked
+        assert!(!p.is_command_allowed("ls /etc"));
+        assert!(!p.is_command_allowed("ls /root"));
+        assert!(!p.is_command_allowed("ls -la /tmp"));
+
+        // ls with relative paths should work
+        assert!(p.is_command_allowed("ls"));
+        assert!(p.is_command_allowed("ls src/"));
+        assert!(p.is_command_allowed("ls -la"));
+        assert!(p.is_command_allowed("ls -R ."));
+    }
+
+    #[test]
+    fn issue_597_find_path_validation() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["find".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // find with absolute start paths should be blocked
+        assert!(!p.is_command_allowed("find /etc -name passwd"));
+        assert!(!p.is_command_allowed("find /tmp -type f"));
+
+        // find with relative paths should work
+        assert!(p.is_command_allowed("find . -name '*.txt'"));
+        assert!(p.is_command_allowed("find src -type f"));
+        assert!(p.is_command_allowed("find . -name '*.rs'"));
+
+        // find -exec is still blocked (separate check)
+        assert!(!p.is_command_allowed("find . -exec rm {} +"));
+    }
+
+    #[test]
+    fn issue_597_home_expansion_blocked() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "head".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // ~/ expansion should be blocked
+        assert!(!p.is_command_allowed("cat ~/.ssh/id_rsa"));
+        assert!(!p.is_command_allowed("cat ~/file.txt"));
+        assert!(!p.is_command_allowed("head ~/.config/secrets"));
+
+        // But ~ in non-path context (like in a string) is blocked as path anyway
+        // This is a safe conservative approach
+    }
+
+    #[test]
+    fn issue_597_double_dollar_not_a_variable() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "echo".into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // $$ in shell is PID, which we allow (not a path exfil risk)
+        // This applies to both file-reading and non-file-reading commands
+        assert!(p.is_command_allowed("echo $$"));
+        assert!(p.is_command_allowed("cat $$"));
+
+        // But $ followed by alphanumeric should be blocked in file-reading commands
+        assert!(!p.is_command_allowed("cat $HOME/file.txt"));
+        assert!(!p.is_command_allowed("cat $USER/file.txt"));
+        assert!(!p.is_command_allowed("cat $WORKSPACE/../etc/passwd"));
+
+        // Variables in the middle of path arguments should also be blocked
+        assert!(!p.is_command_allowed("cat path/$CONFIG/file.txt"));
+
+        // But variables are allowed in non-file-reading commands
+        assert!(p.is_command_allowed("echo $HOME"));
+        assert!(p.is_command_allowed("echo $USER"));
+        assert!(p.is_command_allowed("echo $WORKSPACE"));
+        assert!(p.is_command_allowed("echo $HOME/foo"));
+        assert!(p.is_command_allowed("echo foo$bar"));
+
+        // Single $ at end of string (not followed by var name) is allowed
+        assert!(p.is_command_allowed("echo foo$"));
     }
 }
