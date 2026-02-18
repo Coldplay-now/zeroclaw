@@ -359,6 +359,25 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
 
 6. **Test:** Send a message to your WhatsApp Business number — ZeroClaw will respond via the LLM.
 
+### iMessage Setup (macOS Only)
+
+ZeroClaw can integrate with Apple's Messages app using AppleScript:
+
+1. **Configure ZeroClaw:**
+   ```toml
+   [channels_config.imessage]
+   allowed_contacts = ["+1234567890", "user@icloud.com"]  # or ["*"] for all
+   ```
+
+2. **Start the daemon:**
+   ```bash
+   zeroclaw daemon
+   ```
+
+3. **Send a message:** Open the Messages app on your Mac and send a message to any of the allowed contacts.
+
+**How it works:** ZeroClaw polls the Messages database every 3 seconds and sends replies via AppleScript.
+
 ## Configuration
 
 Config: `~/.zeroclaw/config.toml` (created by `onboard`)
