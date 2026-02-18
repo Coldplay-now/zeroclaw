@@ -170,6 +170,10 @@ impl OtelObserver {
 }
 
 impl Observer for OtelObserver {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn record_event(&self, event: &ObserverEvent) {
         let tracer = global::tracer("zeroclaw");
 
@@ -225,9 +229,10 @@ impl Observer for OtelObserver {
                 span.end();
             }
             ObserverEvent::AgentEnd {
+                provider,
+                model,
                 duration,
                 tokens_used,
-                cost_usd,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -239,13 +244,14 @@ impl Observer for OtelObserver {
                     opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
-                        .with_attributes(vec![KeyValue::new("duration_s", secs)]),
+                        .with_attributes(vec![
+                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model", model.clone()),
+                            KeyValue::new("duration_s", secs),
+                        ]),
                 );
                 if let Some(t) = tokens_used {
                     span.set_attribute(KeyValue::new("tokens_used", *t as i64));
-                }
-                if let Some(c) = cost_usd {
-                    span.set_attribute(KeyValue::new("cost_usd", *c));
                 }
                 span.end();
 
@@ -350,6 +356,10 @@ impl Observer for OtelObserver {
     fn name(&self) -> &str {
         "otel"
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -396,14 +406,16 @@ mod tests {
             error_message: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
-            cost_usd: Some(0.0015),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "gpt-4".into(),
             duration: Duration::ZERO,
             tokens_used: None,
-            cost_usd: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),

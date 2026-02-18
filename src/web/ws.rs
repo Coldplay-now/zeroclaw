@@ -25,7 +25,7 @@ pub enum ServerMessage {
 
 impl ServerMessage {
     fn to_text(&self) -> Message {
-        Message::Text(serde_json::to_string(self).unwrap_or_else(|_| "{}".into()))
+        Message::Text(serde_json::to_string(self).unwrap_or_else(|_| "{}".into()).into())
     }
 }
 

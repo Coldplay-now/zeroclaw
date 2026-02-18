@@ -352,7 +352,6 @@ pub fn run_quick_setup(
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
-<<<<<<< HEAD
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),

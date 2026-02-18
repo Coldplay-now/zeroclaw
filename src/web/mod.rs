@@ -34,6 +34,7 @@ pub async fn run_web_server(config: Config, bind_override: Option<&str>) -> Resu
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
+        config.api_url.as_deref(),
         &config.reliability,
     )?);
 
@@ -57,6 +58,7 @@ pub async fn run_web_server(config: Config, bind_override: Option<&str>) -> Resu
         &tool_descs,
         &skills,
         Some(&config.identity),
+        None, // bootstrap_max_chars
     );
 
     let sessions = Arc::new(SessionManager::new(

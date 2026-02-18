@@ -748,11 +748,7 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         // Add assistant message with tool calls + tool results to history
-<<<<<<< HEAD
         history.push(ChatMessage::assistant(assistant_history_content));
-=======
-        history.push(ChatMessage::assistant(&response));
->>>>>>> origin/feat/web-chat-ui
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 

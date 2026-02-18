@@ -1,11 +1,13 @@
 pub mod log;
 pub mod multi;
 pub mod noop;
+pub mod otel;
 pub mod prometheus;
 pub mod traits;
 
 pub use self::log::LogObserver;
 pub use noop::NoopObserver;
+pub use otel::OtelObserver;
 pub use prometheus::PrometheusObserver;
 pub use traits::{Observer, ObserverEvent};
 
