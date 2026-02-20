@@ -5,6 +5,9 @@ import { PairingForm } from "@/components/PairingForm";
 import { Chat } from "@/components/Chat";
 import { Dashboard } from "@/pages/Dashboard";
 import { Prompts } from "@/pages/Prompts";
+import { Memory } from "@/pages/Memory";
+import { Tools } from "@/pages/Tools";
+import { Scheduler } from "@/pages/Scheduler";
 import { ComingSoon } from "@/pages/ComingSoon";
 import "@/i18n";
 
@@ -71,22 +74,13 @@ function App() {
                       path="/prompts"
                       element={<Prompts />}
                     />
-                    <Route
-                      path="/memory"
-                      element={<ComingSoon page="memory" />}
-                    />
-                    <Route
-                      path="/tools"
-                      element={<ComingSoon page="tools" />}
-                    />
+                    <Route path="/memory" element={<Memory />} />
+                    <Route path="/tools" element={<Tools />} />
                     <Route
                       path="/skills"
                       element={<ComingSoon page="skills" />}
                     />
-                    <Route
-                      path="/scheduler"
-                      element={<ComingSoon page="scheduler" />}
-                    />
+                    <Route path="/scheduler" element={<Scheduler />} />
                     <Route
                       path="/audit"
                       element={<ComingSoon page="audit" />}

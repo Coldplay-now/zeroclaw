@@ -1,0 +1,10 @@
+{
+  "title": "工具",
+  "registered": "已注册",
+  "searchPlaceholder": "搜索工具...",
+  "noSearchResults": "没有匹配的工具",
+  "noTools": "暂无注册工具",
+  "description": "描述",
+  "parameters": "参数定义",
+  "loadError": "加载工具失败"
+}

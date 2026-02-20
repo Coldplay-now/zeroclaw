@@ -16,6 +16,7 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
+use crate::cron;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -548,6 +549,26 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/prompts/{filename}",
             get(handle_prompts_get).put(handle_prompts_put),
         )
+        // Memory API (bearer token required)
+        .route("/memory", get(handle_memory_list).post(handle_memory_store))
+        .route("/memory/stats", get(handle_memory_stats))
+        .route("/memory/search", get(handle_memory_search))
+        .route(
+            "/memory/{key}",
+            get(handle_memory_get).delete(handle_memory_delete),
+        )
+        // Tools API (bearer token required)
+        .route("/tools", get(handle_tools_list))
+        .route("/tools/{name}", get(handle_tools_get))
+        // Cron API (bearer token required)
+        .route("/cron/jobs", get(handle_cron_list).post(handle_cron_create))
+        .route(
+            "/cron/jobs/{id}",
+            get(handle_cron_get)
+                .patch(handle_cron_update)
+                .delete(handle_cron_delete),
+        )
+        .route("/cron/jobs/{id}/runs", get(handle_cron_runs))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -950,6 +971,516 @@ async fn handle_prompts_preview(
     });
 
     (StatusCode::OK, Json(body))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MEMORY API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[derive(serde::Deserialize)]
+struct MemoryListQuery {
+    category: Option<String>,
+    session_id: Option<String>,
+}
+
+/// GET /memory — list memory entries
+async fn handle_memory_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<MemoryListQuery>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let category = query.category.as_deref().map(|c| match c {
+        "core" => MemoryCategory::Core,
+        "daily" => MemoryCategory::Daily,
+        "conversation" => MemoryCategory::Conversation,
+        other => MemoryCategory::Custom(other.to_string()),
+    });
+
+    match state
+        .mem
+        .list(category.as_ref(), query.session_id.as_deref())
+        .await
+    {
+        Ok(entries) => {
+            let count = entries.len();
+            let body = serde_json::json!({
+                "entries": entries,
+                "count": count,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to list memory: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MemoryStoreBody {
+    key: String,
+    content: String,
+    category: Option<String>,
+    session_id: Option<String>,
+}
+
+/// POST /memory — store a memory entry
+async fn handle_memory_store(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<MemoryStoreBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let Json(data) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Invalid JSON: {e}")});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let category = match data.category.as_deref() {
+        Some("core") => MemoryCategory::Core,
+        Some("daily") => MemoryCategory::Daily,
+        Some("conversation") => MemoryCategory::Conversation,
+        Some(other) => MemoryCategory::Custom(other.to_string()),
+        None => MemoryCategory::Custom("api".to_string()),
+    };
+
+    match state
+        .mem
+        .store(
+            &data.key,
+            &data.content,
+            category,
+            data.session_id.as_deref(),
+        )
+        .await
+    {
+        Ok(()) => {
+            let body = serde_json::json!({"stored": true, "key": data.key});
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to store memory: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// GET /memory/stats — memory backend stats
+async fn handle_memory_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let count = state.mem.count().await.unwrap_or(0);
+    let healthy = state.mem.health_check().await;
+
+    let body = serde_json::json!({
+        "backend": state.mem.name(),
+        "count": count,
+        "healthy": healthy,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+#[derive(serde::Deserialize)]
+struct MemorySearchQuery {
+    q: String,
+    limit: Option<usize>,
+    session_id: Option<String>,
+}
+
+/// GET /memory/search — recall/search memory entries
+async fn handle_memory_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<MemorySearchQuery>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let limit = query.limit.unwrap_or(10).min(50);
+
+    match state
+        .mem
+        .recall(&query.q, limit, query.session_id.as_deref())
+        .await
+    {
+        Ok(entries) => {
+            let count = entries.len();
+            let body = serde_json::json!({
+                "entries": entries,
+                "count": count,
+                "query": query.q,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Memory search failed: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// GET /memory/{key} — get a single memory entry
+async fn handle_memory_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    match state.mem.get(&key).await {
+        Ok(Some(entry)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(entry).unwrap_or_default()),
+        ),
+        Ok(None) => {
+            let err = serde_json::json!({"error": format!("Memory key not found: {key}")});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to get memory: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// DELETE /memory/{key} — forget a memory entry
+async fn handle_memory_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    match state.mem.forget(&key).await {
+        Ok(true) => {
+            let body = serde_json::json!({"deleted": true, "key": key});
+            (StatusCode::OK, Json(body))
+        }
+        Ok(false) => {
+            let err = serde_json::json!({"error": format!("Memory key not found: {key}")});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to delete memory: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TOOLS API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /tools — list all registered tools
+async fn handle_tools_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let tools: Vec<serde_json::Value> = state
+        .tools_registry
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name(),
+                "description": t.description(),
+            })
+        })
+        .collect();
+
+    let count = tools.len();
+    let body = serde_json::json!({
+        "tools": tools,
+        "count": count,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+/// GET /tools/{name} — get a single tool's full spec
+async fn handle_tools_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    match state.tools_registry.iter().find(|t| t.name() == name) {
+        Some(tool) => {
+            let spec = tool.spec();
+            let body = serde_json::json!({
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        None => {
+            let err = serde_json::json!({"error": format!("Tool not found: {name}")});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CRON API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /cron/jobs — list all cron jobs
+async fn handle_cron_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let result = cron::list_jobs(&config);
+    drop(config);
+
+    match result {
+        Ok(jobs) => {
+            let count = jobs.len();
+            let body = serde_json::json!({
+                "jobs": jobs,
+                "count": count,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to list cron jobs: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CronCreateBody {
+    schedule: cron::Schedule,
+    #[serde(default)]
+    job_type: cron::JobType,
+    command: Option<String>,
+    prompt: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    session_target: cron::SessionTarget,
+    model: Option<String>,
+    delivery: Option<cron::DeliveryConfig>,
+    #[serde(default)]
+    delete_after_run: bool,
+}
+
+/// POST /cron/jobs — create a new cron job
+async fn handle_cron_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<CronCreateBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let Json(data) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Invalid JSON: {e}")});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let config = state.config.lock();
+    let result = match data.job_type {
+        cron::JobType::Shell => {
+            let Some(ref cmd) = data.command else {
+                drop(config);
+                let err = serde_json::json!({"error": "Shell job requires 'command' field"});
+                return (StatusCode::BAD_REQUEST, Json(err));
+            };
+            cron::add_shell_job(&config, data.name.clone(), data.schedule.clone(), cmd)
+        }
+        cron::JobType::Agent => {
+            let Some(ref prompt) = data.prompt else {
+                drop(config);
+                let err = serde_json::json!({"error": "Agent job requires 'prompt' field"});
+                return (StatusCode::BAD_REQUEST, Json(err));
+            };
+            cron::add_agent_job(
+                &config,
+                data.name.clone(),
+                data.schedule.clone(),
+                prompt,
+                data.session_target.clone(),
+                data.model.clone(),
+                data.delivery.clone(),
+                data.delete_after_run,
+            )
+        }
+    };
+    drop(config);
+
+    match result {
+        Ok(job) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(job).unwrap_or_default()),
+        ),
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to create cron job: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// GET /cron/jobs/{id} — get a single cron job
+async fn handle_cron_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let result = cron::get_job(&config, &id);
+    drop(config);
+
+    match result {
+        Ok(job) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(job).unwrap_or_default()),
+        ),
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Cron job not found: {e}")});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+    }
+}
+
+/// PATCH /cron/jobs/{id} — update a cron job
+async fn handle_cron_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Result<Json<cron::CronJobPatch>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let Json(patch) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Invalid JSON: {e}")});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let config = state.config.lock();
+    let result = cron::update_job(&config, &id, patch);
+    drop(config);
+
+    match result {
+        Ok(job) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(job).unwrap_or_default()),
+        ),
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to update cron job: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// DELETE /cron/jobs/{id} — delete a cron job
+async fn handle_cron_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let result = cron::remove_job(&config, &id);
+    drop(config);
+
+    match result {
+        Ok(()) => {
+            let body = serde_json::json!({"deleted": true, "id": id});
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to delete cron job: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CronRunsQuery {
+    limit: Option<usize>,
+}
+
+/// GET /cron/jobs/{id}/runs — list recent runs for a cron job
+async fn handle_cron_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<CronRunsQuery>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let limit = query.limit.unwrap_or(20).min(100);
+
+    let config = state.config.lock();
+    let result = cron::list_runs(&config, &id, limit);
+    drop(config);
+
+    match result {
+        Ok(runs) => {
+            let count = runs.len();
+            let body = serde_json::json!({
+                "runs": runs,
+                "count": count,
+                "job_id": id,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to list cron runs: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
 }
 
 /// POST /pair — exchange one-time code for bearer token

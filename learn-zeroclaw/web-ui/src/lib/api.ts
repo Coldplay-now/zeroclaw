@@ -152,3 +152,210 @@ export async function getPromptsPreview(): Promise<PromptPreviewResponse> {
     headers: { ...authHeaders() },
   });
 }
+
+// ── Memory ────────────────────────────────────────────────────────────────
+
+export interface MemoryEntry {
+  id: string;
+  key: string;
+  content: string;
+  category: string;
+  timestamp: string;
+  session_id: string | null;
+  score: number | null;
+}
+
+export interface MemoryListResponse {
+  entries: MemoryEntry[];
+  count: number;
+}
+
+export interface MemoryStatsResponse {
+  backend: string;
+  count: number;
+  healthy: boolean;
+}
+
+export async function getMemoryList(
+  category?: string,
+  sessionId?: string,
+): Promise<MemoryListResponse> {
+  const params = new URLSearchParams();
+  if (category) params.set("category", category);
+  if (sessionId) params.set("session_id", sessionId);
+  const qs = params.toString();
+  return apiFetch(`/memory${qs ? `?${qs}` : ""}`, {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function getMemoryStats(): Promise<MemoryStatsResponse> {
+  return apiFetch("/memory/stats", {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function searchMemory(
+  q: string,
+  limit?: number,
+): Promise<MemoryListResponse & { query: string }> {
+  const params = new URLSearchParams({ q });
+  if (limit) params.set("limit", String(limit));
+  return apiFetch(`/memory/search?${params}`, {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function getMemoryEntry(key: string): Promise<MemoryEntry> {
+  return apiFetch(`/memory/${encodeURIComponent(key)}`, {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function storeMemory(
+  key: string,
+  content: string,
+  category?: string,
+): Promise<{ stored: boolean; key: string }> {
+  return apiFetch("/memory", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ key, content, category }),
+  });
+}
+
+export async function deleteMemory(
+  key: string,
+): Promise<{ deleted: boolean; key: string }> {
+  return apiFetch(`/memory/${encodeURIComponent(key)}`, {
+    method: "DELETE",
+    headers: { ...authHeaders() },
+  });
+}
+
+// ── Tools ─────────────────────────────────────────────────────────────────
+
+export interface ToolSummary {
+  name: string;
+  description: string;
+}
+
+export interface ToolDetail {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+export interface ToolsListResponse {
+  tools: ToolSummary[];
+  count: number;
+}
+
+export async function getToolsList(): Promise<ToolsListResponse> {
+  return apiFetch("/tools", {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function getToolDetail(name: string): Promise<ToolDetail> {
+  return apiFetch(`/tools/${encodeURIComponent(name)}`, {
+    headers: { ...authHeaders() },
+  });
+}
+
+// ── Cron Jobs ─────────────────────────────────────────────────────────────
+
+export interface CronJob {
+  id: string;
+  expression: string;
+  schedule: { kind: string; expr?: string; at?: string; every_ms?: number };
+  command: string;
+  prompt: string | null;
+  name: string | null;
+  job_type: string;
+  session_target: string;
+  model: string | null;
+  enabled: boolean;
+  delivery: { mode: string; channel: string | null; to: string | null; best_effort: boolean };
+  delete_after_run: boolean;
+  created_at: string;
+  next_run: string;
+  last_run: string | null;
+  last_status: string | null;
+  last_output: string | null;
+}
+
+export interface CronRun {
+  id: number;
+  job_id: string;
+  started_at: string;
+  finished_at: string;
+  status: string;
+  output: string | null;
+  duration_ms: number | null;
+}
+
+export interface CronJobsListResponse {
+  jobs: CronJob[];
+  count: number;
+}
+
+export interface CronRunsResponse {
+  runs: CronRun[];
+  count: number;
+  job_id: string;
+}
+
+export async function getCronJobs(): Promise<CronJobsListResponse> {
+  return apiFetch("/cron/jobs", {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function getCronJob(id: string): Promise<CronJob> {
+  return apiFetch(`/cron/jobs/${encodeURIComponent(id)}`, {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function createCronJob(
+  body: Record<string, unknown>,
+): Promise<CronJob> {
+  return apiFetch("/cron/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function updateCronJob(
+  id: string,
+  patch: Record<string, unknown>,
+): Promise<CronJob> {
+  return apiFetch(`/cron/jobs/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(patch),
+  });
+}
+
+export async function deleteCronJob(
+  id: string,
+): Promise<{ deleted: boolean; id: string }> {
+  return apiFetch(`/cron/jobs/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function getCronRuns(
+  jobId: string,
+  limit?: number,
+): Promise<CronRunsResponse> {
+  const params = new URLSearchParams();
+  if (limit) params.set("limit", String(limit));
+  const qs = params.toString();
+  return apiFetch(`/cron/jobs/${encodeURIComponent(jobId)}/runs${qs ? `?${qs}` : ""}`, {
+    headers: { ...authHeaders() },
+  });
+}
