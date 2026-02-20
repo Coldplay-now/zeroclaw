@@ -36,11 +36,11 @@ describe("Sidebar", () => {
     expect(screen.getByText("Chat")).toBeInTheDocument();
   });
 
-  it("渲染禁用的导航项（Coming Soon）", () => {
+  it("所有导航项均已启用", () => {
     renderSidebar();
-    // 应该有多个 "Coming Soon" 标签
-    const badges = screen.getAllByText("Coming Soon");
-    expect(badges.length).toBeGreaterThanOrEqual(3);
+    // 所有 11 个导航项都已启用，不应有 "Coming Soon" 标签
+    const badges = screen.queryAllByText("Coming Soon");
+    expect(badges.length).toBe(0);
   });
 
   it("折叠/展开侧边栏", async () => {

@@ -10,6 +10,9 @@ import enTools from "./locales/en/tools.json";
 import enScheduler from "./locales/en/scheduler.json";
 import enAudit from "./locales/en/audit.json";
 import enMetrics from "./locales/en/metrics.json";
+import enSkills from "./locales/en/skills.json";
+import enChannels from "./locales/en/channels.json";
+import enSettings from "./locales/en/settings.json";
 import zhCommon from "./locales/zh/common.json";
 import zhDashboard from "./locales/zh/dashboard.json";
 import zhChat from "./locales/zh/chat.json";
@@ -19,11 +22,14 @@ import zhTools from "./locales/zh/tools.json";
 import zhScheduler from "./locales/zh/scheduler.json";
 import zhAudit from "./locales/zh/audit.json";
 import zhMetrics from "./locales/zh/metrics.json";
+import zhSkills from "./locales/zh/skills.json";
+import zhChannels from "./locales/zh/channels.json";
+import zhSettings from "./locales/zh/settings.json";
 
 i18n.use(initReactI18next).init({
   resources: {
-    en: { common: enCommon, dashboard: enDashboard, chat: enChat, prompts: enPrompts, memory: enMemory, tools: enTools, scheduler: enScheduler, audit: enAudit, metrics: enMetrics },
-    zh: { common: zhCommon, dashboard: zhDashboard, chat: zhChat, prompts: zhPrompts, memory: zhMemory, tools: zhTools, scheduler: zhScheduler, audit: zhAudit, metrics: zhMetrics },
+    en: { common: enCommon, dashboard: enDashboard, chat: enChat, prompts: enPrompts, memory: enMemory, tools: enTools, scheduler: enScheduler, audit: enAudit, metrics: enMetrics, skills: enSkills, channels: enChannels, settings: enSettings },
+    zh: { common: zhCommon, dashboard: zhDashboard, chat: zhChat, prompts: zhPrompts, memory: zhMemory, tools: zhTools, scheduler: zhScheduler, audit: zhAudit, metrics: zhMetrics, skills: zhSkills, channels: zhChannels, settings: zhSettings },
   },
   lng: (() => { try { return localStorage.getItem("zeroclaw_lang") || undefined; } catch { return undefined; } })(),
   fallbackLng: "en",

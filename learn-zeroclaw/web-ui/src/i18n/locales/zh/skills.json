@@ -1,0 +1,15 @@
+{
+  "title": "技能",
+  "installed": "已安装",
+  "searchPlaceholder": "搜索技能...",
+  "noSkills": "暂无已安装技能",
+  "noResults": "没有匹配的技能",
+  "loadError": "加载技能失败",
+  "tools": "个工具",
+  "prompts": "个提示词",
+  "author": "作者",
+  "toolsList": "工具列表",
+  "promptsList": "提示词列表",
+  "close": "关闭",
+  "notFound": "技能未找到"
+}

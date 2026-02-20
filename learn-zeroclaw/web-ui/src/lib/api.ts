@@ -430,3 +430,105 @@ export async function getMetrics(): Promise<MetricsResponse> {
     headers: { ...authHeaders() },
   });
 }
+
+// ── Skills ────────────────────────────────────────────────────────────────
+
+export interface SkillSummary {
+  name: string;
+  description: string;
+  version: string;
+  author: string | null;
+  tags: string[];
+  tools_count: number;
+  prompts_count: number;
+}
+
+export interface SkillDetail {
+  name: string;
+  description: string;
+  version: string;
+  author: string | null;
+  tags: string[];
+  tools: { name: string; description: string; kind: string; command: string }[];
+  prompts: string[];
+}
+
+export interface SkillsListResponse {
+  skills: SkillSummary[];
+  count: number;
+}
+
+export async function getSkillsList(): Promise<SkillsListResponse> {
+  return apiFetch("/skills", {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function getSkillDetail(name: string): Promise<SkillDetail> {
+  return apiFetch(`/skills/${encodeURIComponent(name)}`, {
+    headers: { ...authHeaders() },
+  });
+}
+
+// ── Config ────────────────────────────────────────────────────────────────
+
+export interface ConfigResponse {
+  default_provider: string | null;
+  default_model: string | null;
+  default_temperature: number;
+  api_key: string | null;
+  api_url: string | null;
+  autonomy: { level: string; workspace_only: boolean; max_actions_per_hour: number };
+  memory: { backend: string; auto_save: boolean };
+  heartbeat: { enabled: boolean; interval_minutes: number };
+  cron: { enabled: boolean; max_run_history: number };
+  observability: { backend: string };
+  gateway: { port: number; host: string; require_pairing: boolean };
+  cost: { enabled: boolean; daily_limit_usd: number; monthly_limit_usd: number; warn_at_percent: number };
+  agent: { max_tool_iterations: number; max_history_messages: number; parallel_tools: boolean };
+}
+
+export interface ConfigPatchResponse {
+  updated: string[];
+  rejected: string[];
+  rejected_reason: string | null;
+}
+
+export async function getConfig(): Promise<ConfigResponse> {
+  return apiFetch("/config", {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function patchConfig(
+  patch: Record<string, unknown>,
+): Promise<ConfigPatchResponse> {
+  return apiFetch("/config", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(patch),
+  });
+}
+
+// ── Channels ──────────────────────────────────────────────────────────────
+
+export interface ChannelInfo {
+  name: string;
+  configured: boolean;
+  status: string;
+  restart_count: number;
+  last_ok: string | null;
+  last_error: string | null;
+}
+
+export interface ChannelsListResponse {
+  channels: ChannelInfo[];
+  total: number;
+  configured: number;
+}
+
+export async function getChannelsList(): Promise<ChannelsListResponse> {
+  return apiFetch("/channels", {
+    headers: { ...authHeaders() },
+  });
+}

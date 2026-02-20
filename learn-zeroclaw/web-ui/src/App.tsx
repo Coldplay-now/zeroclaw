@@ -10,7 +10,10 @@ import { Tools } from "@/pages/Tools";
 import { Scheduler } from "@/pages/Scheduler";
 import { Audit } from "@/pages/Audit";
 import { Metrics } from "@/pages/Metrics";
-import { ComingSoon } from "@/pages/ComingSoon";
+import { Skills } from "@/pages/Skills";
+import { Channels } from "@/pages/Channels";
+import { Settings } from "@/pages/Settings";
+import { GlobalSearch } from "@/components/GlobalSearch";
 import "@/i18n";
 
 const queryClient = new QueryClient({
@@ -38,6 +41,7 @@ function DashboardLayout({ children }: { children: React.ReactNode }) {
     <div className="flex h-screen bg-background">
       <Sidebar />
       <main className="flex-1 overflow-y-auto">{children}</main>
+      <GlobalSearch />
     </div>
   );
 }
@@ -80,18 +84,18 @@ function App() {
                     <Route path="/tools" element={<Tools />} />
                     <Route
                       path="/skills"
-                      element={<ComingSoon page="skills" />}
+                      element={<Skills />}
                     />
                     <Route path="/scheduler" element={<Scheduler />} />
                     <Route path="/audit" element={<Audit />} />
                     <Route path="/metrics" element={<Metrics />} />
                     <Route
                       path="/channels"
-                      element={<ComingSoon page="channels" />}
+                      element={<Channels />}
                     />
                     <Route
                       path="/settings"
-                      element={<ComingSoon page="settings" />}
+                      element={<Settings />}
                     />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>

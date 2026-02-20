@@ -38,6 +38,14 @@
     "hoursAgo": "{{count}} 小时前",
     "daysAgo": "{{count}} 天前"
   },
+  "search": {
+    "placeholder": "搜索页面和记忆...",
+    "noResults": "未找到结果",
+    "pages": "页面",
+    "memory": "记忆",
+    "navigate": "导航",
+    "select": "选择"
+  },
   "errors": {
     "gatewayOffline": "网关离线",
     "gatewayOfflineDesc": "无法连接 ZeroClaw 网关",

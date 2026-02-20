@@ -17,6 +17,7 @@ use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
 use crate::cron;
+use crate::skills;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -573,6 +574,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/audit/logs", get(handle_audit_logs))
         // Metrics API (bearer token required)
         .route("/metrics", get(handle_metrics))
+        // Skills API (bearer token required)
+        .route("/skills", get(handle_skills_list))
+        .route("/skills/{name}", get(handle_skills_get))
+        // Config API (bearer token required)
+        .route("/config", get(handle_config_get).patch(handle_config_patch))
+        // Channels API (bearer token required)
+        .route("/channels", get(handle_channels_list))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1665,6 +1673,285 @@ async fn handle_metrics(
         "hint": "For time-series metrics, configure observability.backend = \"otel\" with an external collector.",
     });
 
+    (StatusCode::OK, Json(body))
+}
+
+/// GET /skills — list all installed skills
+async fn handle_skills_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let workspace_dir = config.workspace_dir.clone();
+    drop(config);
+
+    let all_skills = skills::load_skills(&workspace_dir);
+    let skills_json: Vec<serde_json::Value> = all_skills
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "version": s.version,
+                "author": s.author,
+                "tags": s.tags,
+                "tools_count": s.tools.len(),
+                "prompts_count": s.prompts.len(),
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "skills": skills_json,
+        "count": all_skills.len(),
+    });
+    (StatusCode::OK, Json(body))
+}
+
+/// GET /skills/{name} — get skill detail
+async fn handle_skills_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let workspace_dir = config.workspace_dir.clone();
+    drop(config);
+
+    let all_skills = skills::load_skills(&workspace_dir);
+    match all_skills.into_iter().find(|s| s.name == name) {
+        Some(skill) => {
+            let body = serde_json::json!({
+                "name": skill.name,
+                "description": skill.description,
+                "version": skill.version,
+                "author": skill.author,
+                "tags": skill.tags,
+                "tools": skill.tools,
+                "prompts": skill.prompts,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        None => {
+            let err = serde_json::json!({"error": format!("Skill '{}' not found", name)});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+    }
+}
+
+/// GET /config — return sanitized config (sensitive fields masked)
+async fn handle_config_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let body = serde_json::json!({
+        "default_provider": config.default_provider,
+        "default_model": config.default_model,
+        "default_temperature": config.default_temperature,
+        "api_key": config.api_key.as_ref().map(|_| "***"),
+        "api_url": config.api_url,
+        "autonomy": {
+            "level": config.autonomy.level,
+            "workspace_only": config.autonomy.workspace_only,
+            "max_actions_per_hour": config.autonomy.max_actions_per_hour,
+        },
+        "memory": {
+            "backend": &config.memory.backend,
+            "auto_save": config.memory.auto_save,
+        },
+        "heartbeat": {
+            "enabled": config.heartbeat.enabled,
+            "interval_minutes": config.heartbeat.interval_minutes,
+        },
+        "cron": {
+            "enabled": config.cron.enabled,
+            "max_run_history": config.cron.max_run_history,
+        },
+        "observability": {
+            "backend": &config.observability.backend,
+        },
+        "gateway": {
+            "port": config.gateway.port,
+            "host": &config.gateway.host,
+            "require_pairing": config.gateway.require_pairing,
+        },
+        "cost": {
+            "enabled": config.cost.enabled,
+            "daily_limit_usd": config.cost.daily_limit_usd,
+            "monthly_limit_usd": config.cost.monthly_limit_usd,
+            "warn_at_percent": config.cost.warn_at_percent,
+        },
+        "agent": {
+            "max_tool_iterations": config.agent.max_tool_iterations,
+            "max_history_messages": config.agent.max_history_messages,
+            "parallel_tools": config.agent.parallel_tools,
+        },
+    });
+    drop(config);
+
+    (StatusCode::OK, Json(body))
+}
+
+/// PATCH /config — hot-update whitelisted fields
+async fn handle_config_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(patch): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let patch_obj = match patch.as_object() {
+        Some(obj) => obj,
+        None => {
+            let err = serde_json::json!({"error": "Request body must be a JSON object"});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    // Whitelist of hot-updatable fields
+    let allowed: &[&str] = &[
+        "default_model",
+        "default_temperature",
+        "autonomy_level",
+        "memory_auto_save",
+        "heartbeat_enabled",
+        "heartbeat_interval_minutes",
+    ];
+
+    let mut updated = Vec::new();
+    let mut rejected = Vec::new();
+
+    let mut config = state.config.lock();
+    for (key, value) in patch_obj {
+        if !allowed.contains(&key.as_str()) {
+            rejected.push(key.clone());
+            continue;
+        }
+        match key.as_str() {
+            "default_model" => {
+                if let Some(v) = value.as_str() {
+                    config.default_model = Some(v.to_string());
+                    updated.push(key.clone());
+                }
+            }
+            "default_temperature" => {
+                if let Some(v) = value.as_f64() {
+                    config.default_temperature = v;
+                    updated.push(key.clone());
+                }
+            }
+            "autonomy_level" => {
+                if let Some(v) = value.as_str() {
+                    if let Ok(level) =
+                        serde_json::from_value::<crate::security::AutonomyLevel>(
+                            serde_json::Value::String(v.to_string()),
+                        )
+                    {
+                        config.autonomy.level = level;
+                        updated.push(key.clone());
+                    }
+                }
+            }
+            "memory_auto_save" => {
+                if let Some(v) = value.as_bool() {
+                    config.memory.auto_save = v;
+                    updated.push(key.clone());
+                }
+            }
+            "heartbeat_enabled" => {
+                if let Some(v) = value.as_bool() {
+                    config.heartbeat.enabled = v;
+                    updated.push(key.clone());
+                }
+            }
+            "heartbeat_interval_minutes" => {
+                if let Some(v) = value.as_u64() {
+                    if let Ok(minutes) = u32::try_from(v) {
+                        config.heartbeat.interval_minutes = minutes;
+                        updated.push(key.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(config);
+
+    let body = serde_json::json!({
+        "updated": updated,
+        "rejected": rejected,
+        "rejected_reason": if rejected.is_empty() { None } else { Some("Field not in hot-update whitelist. Requires restart.") },
+    });
+    (StatusCode::OK, Json(body))
+}
+
+/// GET /channels — list configured channels with health status
+async fn handle_channels_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let health = crate::health::snapshot();
+
+    let mut channels = Vec::new();
+
+    // Check each channel config
+    let channel_checks: Vec<(&str, bool)> = vec![
+        ("cli", config.channels_config.cli),
+        ("telegram", config.channels_config.telegram.is_some()),
+        ("discord", config.channels_config.discord.is_some()),
+        ("slack", config.channels_config.slack.is_some()),
+        ("mattermost", config.channels_config.mattermost.is_some()),
+        ("webhook", config.channels_config.webhook.is_some()),
+        ("imessage", config.channels_config.imessage.is_some()),
+        ("matrix", config.channels_config.matrix.is_some()),
+        ("signal", config.channels_config.signal.is_some()),
+        ("whatsapp", config.channels_config.whatsapp.is_some()),
+        ("email", config.channels_config.email.is_some()),
+        ("irc", config.channels_config.irc.is_some()),
+        ("lark", config.channels_config.lark.is_some()),
+        ("dingtalk", config.channels_config.dingtalk.is_some()),
+        ("qq", config.channels_config.qq.is_some()),
+    ];
+    drop(config);
+
+    for (name, configured) in &channel_checks {
+        let comp_health = health.components.get(*name);
+        channels.push(serde_json::json!({
+            "name": name,
+            "configured": configured,
+            "status": comp_health.map(|c| c.status.as_str()).unwrap_or("unknown"),
+            "restart_count": comp_health.map(|c| c.restart_count).unwrap_or(0),
+            "last_ok": comp_health.and_then(|c| c.last_ok.as_deref()),
+            "last_error": comp_health.and_then(|c| c.last_error.as_deref()),
+        }));
+    }
+
+    let configured_count = channel_checks.iter().filter(|(_, c)| *c).count();
+    let body = serde_json::json!({
+        "channels": channels,
+        "total": channel_checks.len(),
+        "configured": configured_count,
+    });
     (StatusCode::OK, Json(body))
 }
 

@@ -38,6 +38,14 @@
     "hoursAgo": "{{count}}h ago",
     "daysAgo": "{{count}}d ago"
   },
+  "search": {
+    "placeholder": "Search pages and memory...",
+    "noResults": "No results found",
+    "pages": "Pages",
+    "memory": "Memory",
+    "navigate": "navigate",
+    "select": "select"
+  },
   "errors": {
     "gatewayOffline": "Gateway Offline",
     "gatewayOfflineDesc": "Cannot reach ZeroClaw gateway",
