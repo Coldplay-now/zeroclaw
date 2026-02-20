@@ -7,9 +7,10 @@ import "@/i18n";
 // 模拟 API
 vi.mock("@/lib/api", () => ({
   getStatus: vi.fn(),
+  getMetrics: vi.fn(),
 }));
 
-import { getStatus } from "@/lib/api";
+import { getStatus, getMetrics } from "@/lib/api";
 
 const mockStatus = {
   version: "0.1.0",
@@ -59,18 +60,29 @@ describe("Dashboard", () => {
   it("显示加载骨架屏", () => {
     // getStatus 永远 pending
     vi.mocked(getStatus).mockReturnValue(new Promise(() => {}));
+    vi.mocked(getMetrics).mockReturnValue(new Promise(() => {}));
     renderWithProviders(<Dashboard />);
     expect(screen.getByText("ZeroClaw Dashboard")).toBeInTheDocument();
   });
 
   it("显示错误状态", async () => {
     vi.mocked(getStatus).mockRejectedValue(new Error("Network error"));
+    vi.mocked(getMetrics).mockReturnValue(new Promise(() => {}));
     renderWithProviders(<Dashboard />);
     expect(await screen.findByText("Network error")).toBeInTheDocument();
   });
 
   it("成功渲染状态数据", async () => {
     vi.mocked(getStatus).mockResolvedValue(mockStatus);
+    vi.mocked(getMetrics).mockResolvedValue({
+      uptime_seconds: 3661,
+      pid: 12345,
+      observer: "log",
+      components: { total: 2, ok: 2, error: 0, total_restarts: 1 },
+      memory: { backend: "sqlite", count: 42, healthy: true },
+      tools: { registered: 10 },
+      cron: { total: 3, active: 2, paused: 1 },
+    });
     renderWithProviders(<Dashboard />);
     // 等待数据加载完成
     expect(await screen.findByText("v0.1.0")).toBeInTheDocument();

@@ -1,0 +1,17 @@
+{
+  "title": "Audit Log",
+  "totalEntries": "entries",
+  "allTypes": "All Types",
+  "noEntries": "No audit log entries",
+  "loadError": "Failed to load audit logs",
+  "disabled": "Audit logging is disabled",
+  "eventType": {
+    "command_execution": "Command Execution",
+    "file_access": "File Access",
+    "config_change": "Config Change",
+    "auth_success": "Auth Success",
+    "auth_failure": "Auth Failure",
+    "policy_violation": "Policy Violation",
+    "security_event": "Security Event"
+  }
+}

@@ -1,6 +1,6 @@
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
-import { getStatus, type StatusResponse } from "@/lib/api";
+import { getStatus, getMetrics, type StatusResponse } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Activity,
@@ -33,6 +33,12 @@ export function Dashboard() {
     queryKey: ["status"],
     queryFn: getStatus,
     refetchInterval: 10_000,
+  });
+
+  const metricsQuery = useQuery({
+    queryKey: ["metrics"],
+    queryFn: getMetrics,
+    refetchInterval: 30_000,
   });
 
   if (isLoading) {
@@ -182,7 +188,7 @@ export function Dashboard() {
         </CardContent>
       </Card>
 
-      {/* Quick Stats (placeholder) */}
+      {/* Quick Stats */}
       <Card>
         <CardHeader>
           <CardTitle className="text-sm font-medium">
@@ -192,15 +198,15 @@ export function Dashboard() {
         <CardContent>
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
             {[
-              { label: t("llmRequests"), value: t("noData") },
-              { label: t("tokenUsage"), value: t("noData") },
-              { label: t("toolCalls"), value: t("noData") },
-              { label: t("cost"), value: t("noData") },
-              { label: t("errors"), value: t("noData") },
-              { label: t("avgLatency"), value: t("noData") },
+              { label: t("memoryEntries"), value: metricsQuery.data ? String(metricsQuery.data.memory.count) : t("noData") },
+              { label: t("toolsRegistered"), value: metricsQuery.data ? String(metricsQuery.data.tools.registered) : t("noData") },
+              { label: t("cronJobs"), value: metricsQuery.data?.cron ? String(metricsQuery.data.cron.total) : t("noData") },
+              { label: t("cronActive"), value: metricsQuery.data?.cron ? String(metricsQuery.data.cron.active) : t("noData") },
+              { label: t("totalRestarts"), value: metricsQuery.data ? String(metricsQuery.data.components.total_restarts) : t("noData") },
+              { label: t("observerBackend"), value: metricsQuery.data?.observer ?? t("noData") },
             ].map((stat) => (
               <div key={stat.label} className="text-center">
-                <p className="text-2xl font-bold text-muted-foreground/50">
+                <p className={`text-2xl font-bold ${stat.value === t("noData") ? "text-muted-foreground/50" : ""}`}>
                   {stat.value}
                 </p>
                 <p className="text-xs text-muted-foreground mt-1">

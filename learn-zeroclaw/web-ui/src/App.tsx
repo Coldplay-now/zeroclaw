@@ -8,6 +8,8 @@ import { Prompts } from "@/pages/Prompts";
 import { Memory } from "@/pages/Memory";
 import { Tools } from "@/pages/Tools";
 import { Scheduler } from "@/pages/Scheduler";
+import { Audit } from "@/pages/Audit";
+import { Metrics } from "@/pages/Metrics";
 import { ComingSoon } from "@/pages/ComingSoon";
 import "@/i18n";
 
@@ -81,14 +83,8 @@ function App() {
                       element={<ComingSoon page="skills" />}
                     />
                     <Route path="/scheduler" element={<Scheduler />} />
-                    <Route
-                      path="/audit"
-                      element={<ComingSoon page="audit" />}
-                    />
-                    <Route
-                      path="/metrics"
-                      element={<ComingSoon page="metrics" />}
-                    />
+                    <Route path="/audit" element={<Audit />} />
+                    <Route path="/metrics" element={<Metrics />} />
                     <Route
                       path="/channels"
                       element={<ComingSoon page="channels" />}

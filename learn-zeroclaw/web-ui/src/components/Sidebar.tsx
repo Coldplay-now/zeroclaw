@@ -35,8 +35,8 @@ const navItems: NavItem[] = [
   { key: "tools", icon: Wrench, path: "/tools", enabled: true },
   { key: "skills", icon: Puzzle, path: "/skills", enabled: false },
   { key: "scheduler", icon: Clock, path: "/scheduler", enabled: true },
-  { key: "audit", icon: Shield, path: "/audit", enabled: false },
-  { key: "metrics", icon: BarChart3, path: "/metrics", enabled: false },
+  { key: "audit", icon: Shield, path: "/audit", enabled: true },
+  { key: "metrics", icon: BarChart3, path: "/metrics", enabled: true },
   { key: "channels", icon: Radio, path: "/channels", enabled: false },
   { key: "settings", icon: Settings, path: "/settings", enabled: false },
 ];

@@ -569,6 +569,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 .delete(handle_cron_delete),
         )
         .route("/cron/jobs/{id}/runs", get(handle_cron_runs))
+        // Audit API (bearer token required)
+        .route("/audit/logs", get(handle_audit_logs))
+        // Metrics API (bearer token required)
+        .route("/metrics", get(handle_metrics))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1481,6 +1485,187 @@ async fn handle_cron_runs(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AUDIT API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[derive(serde::Deserialize)]
+struct AuditLogsQuery {
+    /// Filter by event type (e.g. "command_execution", "policy_violation")
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    /// Maximum number of entries to return (default 100, max 500)
+    limit: Option<usize>,
+    /// Number of entries to skip (for pagination)
+    offset: Option<usize>,
+}
+
+/// GET /audit/logs — return recent audit log entries from the JSONL audit file
+async fn handle_audit_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditLogsQuery>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    // Audit log lives at {zeroclaw_dir}/audit.log (default).
+    // zeroclaw_dir is config_path's parent directory.
+    let audit_log_path = config
+        .config_path
+        .parent()
+        .map(|p| p.join("audit.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("audit.log"));
+    drop(config);
+
+    let audit_enabled = true; // always attempt to read if file exists
+
+    if !audit_enabled {
+        let body = serde_json::json!({
+            "entries": [],
+            "count": 0,
+            "total": 0,
+            "enabled": false,
+            "message": "Audit logging is disabled in configuration",
+        });
+        return (StatusCode::OK, Json(body));
+    }
+
+    // Read the JSONL audit log file
+    let content = match std::fs::read_to_string(&audit_log_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let body = serde_json::json!({
+                "entries": [],
+                "count": 0,
+                "total": 0,
+                "enabled": true,
+                "message": "No audit log entries yet",
+            });
+            return (StatusCode::OK, Json(body));
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to read audit log: {e}")});
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+        }
+    };
+
+    // Parse JSONL lines into audit events, newest first
+    let mut entries: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    entries.reverse(); // newest first
+
+    // Apply type filter
+    if let Some(ref event_type) = query.event_type {
+        entries.retain(|e| {
+            e.get("event_type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t == event_type.as_str())
+        });
+    }
+
+    let total = entries.len();
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).min(500);
+
+    let page: Vec<serde_json::Value> = entries.into_iter().skip(offset).take(limit).collect();
+    let count = page.len();
+
+    let body = serde_json::json!({
+        "entries": page,
+        "count": count,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "enabled": true,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// METRICS API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /metrics — return aggregated metrics snapshot
+///
+/// Since the Observer trait is write-only (no query interface), this endpoint
+/// returns what is available from the health system and basic system counters.
+/// For full time-series metrics, configure the "otel" observer backend with an
+/// external collector (Prometheus, Grafana, etc.).
+async fn handle_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let health = crate::health::snapshot();
+
+    // Collect memory stats
+    let memory_count = state.mem.count().await.unwrap_or(0);
+    let memory_healthy = state.mem.health_check().await;
+
+    // Collect tools count
+    let tools_count = state.tools_registry.len();
+
+    // Collect cron job stats
+    let config = state.config.lock();
+    let cron_stats = cron::list_jobs(&config).ok().map(|jobs| {
+        let total = jobs.len();
+        let active = jobs.iter().filter(|j| j.enabled).count();
+        serde_json::json!({
+            "total": total,
+            "active": active,
+            "paused": total - active,
+        })
+    });
+    drop(config);
+
+    // Build component health summary
+    let mut components_ok = 0usize;
+    let mut components_error = 0usize;
+    let mut total_restarts = 0u64;
+    for comp in health.components.values() {
+        if comp.status == "ok" {
+            components_ok += 1;
+        } else {
+            components_error += 1;
+        }
+        total_restarts += comp.restart_count;
+    }
+
+    let body = serde_json::json!({
+        "uptime_seconds": health.uptime_seconds,
+        "pid": health.pid,
+        "observer": state.observer.name(),
+        "components": {
+            "ok": components_ok,
+            "error": components_error,
+            "total": health.components.len(),
+            "total_restarts": total_restarts,
+        },
+        "memory": {
+            "backend": state.mem.name(),
+            "count": memory_count,
+            "healthy": memory_healthy,
+        },
+        "tools": {
+            "registered": tools_count,
+        },
+        "cron": cron_stats,
+        "hint": "For time-series metrics, configure observability.backend = \"otel\" with an external collector.",
+    });
+
+    (StatusCode::OK, Json(body))
 }
 
 /// POST /pair — exchange one-time code for bearer token

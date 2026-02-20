@@ -359,3 +359,74 @@ export async function getCronRuns(
     headers: { ...authHeaders() },
   });
 }
+
+// ── Audit Logs ────────────────────────────────────────────────────────────
+
+export interface AuditEntry {
+  timestamp: string;
+  event_id: string;
+  event_type: string;
+  actor: { channel: string; user_id: string | null; username: string | null } | null;
+  action: { command: string | null; risk_level: string | null; approved: boolean; allowed: boolean } | null;
+  result: { success: boolean; exit_code: number | null; duration_ms: number | null; error: string | null } | null;
+  security: { policy_violation: boolean; rate_limit_remaining: number | null; sandbox_backend: string | null };
+}
+
+export interface AuditLogsResponse {
+  entries: AuditEntry[];
+  count: number;
+  total: number;
+  offset: number;
+  limit: number;
+  enabled: boolean;
+  message?: string;
+}
+
+export async function getAuditLogs(
+  eventType?: string,
+  limit?: number,
+  offset?: number,
+): Promise<AuditLogsResponse> {
+  const params = new URLSearchParams();
+  if (eventType) params.set("type", eventType);
+  if (limit) params.set("limit", String(limit));
+  if (offset) params.set("offset", String(offset));
+  const qs = params.toString();
+  return apiFetch(`/audit/logs${qs ? `?${qs}` : ""}`, {
+    headers: { ...authHeaders() },
+  });
+}
+
+// ── Metrics ───────────────────────────────────────────────────────────────
+
+export interface MetricsResponse {
+  uptime_seconds: number;
+  pid: number;
+  observer: string;
+  components: {
+    ok: number;
+    error: number;
+    total: number;
+    total_restarts: number;
+  };
+  memory: {
+    backend: string;
+    count: number;
+    healthy: boolean;
+  };
+  tools: {
+    registered: number;
+  };
+  cron: {
+    total: number;
+    active: number;
+    paused: number;
+  } | null;
+  hint: string;
+}
+
+export async function getMetrics(): Promise<MetricsResponse> {
+  return apiFetch("/metrics", {
+    headers: { ...authHeaders() },
+  });
+}
