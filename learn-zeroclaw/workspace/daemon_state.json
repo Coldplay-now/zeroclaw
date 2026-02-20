@@ -1,0 +1,43 @@
+{
+  "components": {
+    "channel:telegram": {
+      "last_error": null,
+      "last_ok": "2026-02-20T14:35:18.394739+00:00",
+      "restart_count": 0,
+      "status": "ok",
+      "updated_at": "2026-02-20T14:35:18.394734+00:00"
+    },
+    "channels": {
+      "last_error": null,
+      "last_ok": "2026-02-20T14:35:18.394625+00:00",
+      "restart_count": 0,
+      "status": "ok",
+      "updated_at": "2026-02-20T14:35:18.394615+00:00"
+    },
+    "daemon": {
+      "last_error": null,
+      "last_ok": "2026-02-20T14:35:17.336898+00:00",
+      "restart_count": 0,
+      "status": "ok",
+      "updated_at": "2026-02-20T14:35:17.336748+00:00"
+    },
+    "gateway": {
+      "last_error": null,
+      "last_ok": "2026-02-20T14:35:17.347947+00:00",
+      "restart_count": 0,
+      "status": "ok",
+      "updated_at": "2026-02-20T14:35:17.347944+00:00"
+    },
+    "scheduler": {
+      "last_error": null,
+      "last_ok": "2026-02-20T15:14:02.346428+00:00",
+      "restart_count": 0,
+      "status": "ok",
+      "updated_at": "2026-02-20T15:14:02.346403+00:00"
+    }
+  },
+  "pid": 32617,
+  "updated_at": "2026-02-20T15:34:27.343300+00:00",
+  "uptime_seconds": 3550,
+  "written_at": "2026-02-20T15:34:27.343355+00:00"
+}
