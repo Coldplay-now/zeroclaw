@@ -39,12 +39,35 @@ export async function pair(
 
 // ── Chat / Webhook ─────────────────────────────────────────────────────────
 
+export interface AgentStep {
+  type: "LlmRequest" | "ToolCall";
+  // LlmRequest fields
+  provider?: string;
+  model?: string;
+  messages_count?: number;
+  duration_ms: number;
+  success: boolean;
+  error?: string | null;
+  response_preview?: string | null;
+  // ToolCall fields
+  tool?: string;
+  arguments?: Record<string, unknown>;
+  output_preview?: string;
+}
+
+export interface AgentTrace {
+  steps: AgentStep[];
+  total_duration_ms: number;
+  iterations: number;
+}
+
 export interface MessageResponse {
   response?: string;
   model?: string;
   tool_calls?: string[];
   duration_ms?: number;
   error?: string;
+  trace?: AgentTrace;
 }
 
 export async function sendMessage(message: string): Promise<MessageResponse> {

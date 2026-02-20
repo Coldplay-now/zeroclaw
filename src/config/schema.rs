@@ -78,6 +78,12 @@ pub struct Config {
     pub http_request: HttpRequestConfig,
 
     #[serde(default)]
+    pub email_tool: EmailToolConfig,
+
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
+
+    #[serde(default)]
     pub identity: IdentityConfig,
 
     #[serde(default)]
@@ -715,6 +721,96 @@ fn default_http_max_response_size() -> usize {
 
 fn default_http_timeout_secs() -> u64 {
     30
+}
+
+// ── Email send tool ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailToolConfig {
+    /// Enable `email_send` tool for sending emails via SMTP
+    #[serde(default)]
+    pub enabled: bool,
+    /// SMTP server hostname (e.g. "smtp.gmail.com")
+    #[serde(default)]
+    pub smtp_host: String,
+    /// SMTP server port (default: 465 for TLS)
+    #[serde(default = "default_email_smtp_port")]
+    pub smtp_port: u16,
+    /// Use TLS for SMTP connection (default: true)
+    #[serde(default = "default_email_smtp_tls")]
+    pub smtp_tls: bool,
+    /// SMTP username for authentication
+    #[serde(default)]
+    pub username: String,
+    /// SMTP password / app-specific authorization code
+    #[serde(default)]
+    pub password: String,
+    /// Sender address for outgoing emails
+    #[serde(default)]
+    pub from_address: String,
+    /// Allowed recipient addresses/domains (empty = deny all, `["*"]` = allow all)
+    #[serde(default)]
+    pub allowed_recipients: Vec<String>,
+}
+
+impl Default for EmailToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smtp_host: String::new(),
+            smtp_port: default_email_smtp_port(),
+            smtp_tls: true,
+            username: String::new(),
+            password: String::new(),
+            from_address: String::new(),
+            allowed_recipients: Vec::new(),
+        }
+    }
+}
+
+fn default_email_smtp_port() -> u16 {
+    465
+}
+
+fn default_email_smtp_tls() -> bool {
+    true
+}
+
+// ── Web search tool (Brave Search API) ───────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchConfig {
+    /// Enable `web_search` tool for searching the web via Brave Search API
+    #[serde(default)]
+    pub enabled: bool,
+    /// Brave Search API key (can also be set via BRAVE_API_KEY env var)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Maximum number of results to return (default: 5)
+    #[serde(default = "default_web_search_max_results")]
+    pub max_results: usize,
+    /// Request timeout in seconds (default: 10)
+    #[serde(default = "default_web_search_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            max_results: default_web_search_max_results(),
+            timeout_secs: default_web_search_timeout_secs(),
+        }
+    }
+}
+
+fn default_web_search_max_results() -> usize {
+    5
+}
+
+fn default_web_search_timeout_secs() -> u64 {
+    10
 }
 
 // ── Memory ───────────────────────────────────────────────────
@@ -1719,6 +1815,8 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            email_tool: EmailToolConfig::default(),
+            web_search: WebSearchConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
@@ -2083,6 +2181,22 @@ impl Config {
                 }
             }
         }
+
+        // Telegram: ZEROCLAW_TELEGRAM_BOT_TOKEN + ZEROCLAW_TELEGRAM_ALLOWED_USERS
+        if let Ok(token) = std::env::var("ZEROCLAW_TELEGRAM_BOT_TOKEN") {
+            if !token.is_empty() {
+                let allowed_users = std::env::var("ZEROCLAW_TELEGRAM_ALLOWED_USERS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>();
+                self.channels_config.telegram = Some(TelegramConfig {
+                    bot_token: token,
+                    allowed_users,
+                });
+            }
+        }
     }
 
     /// Validate that the workspace directory is usable.
@@ -2421,6 +2535,8 @@ default_temperature = 0.7
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            email_tool: EmailToolConfig::default(),
+            web_search: WebSearchConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -2530,6 +2646,8 @@ tool_dispatcher = "xml"
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            email_tool: EmailToolConfig::default(),
+            web_search: WebSearchConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
