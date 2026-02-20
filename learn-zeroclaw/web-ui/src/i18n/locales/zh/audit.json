@@ -1,0 +1,17 @@
+{
+  "title": "审计日志",
+  "totalEntries": "条记录",
+  "allTypes": "全部类型",
+  "noEntries": "暂无审计日志",
+  "loadError": "加载审计日志失败",
+  "disabled": "审计日志已在配置中禁用",
+  "eventType": {
+    "command_execution": "命令执行",
+    "file_access": "文件访问",
+    "config_change": "配置变更",
+    "auth_success": "认证成功",
+    "auth_failure": "认证失败",
+    "policy_violation": "策略违规",
+    "security_event": "安全事件"
+  }
+}

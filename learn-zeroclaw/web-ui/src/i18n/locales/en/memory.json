@@ -1,0 +1,27 @@
+{
+  "title": "Memory",
+  "addEntry": "Add Entry",
+  "backend": "Backend",
+  "totalEntries": "Total Entries",
+  "health": "Health",
+  "healthy": "Healthy",
+  "unhealthy": "Unhealthy",
+  "keyPlaceholder": "Memory key...",
+  "contentPlaceholder": "Memory content...",
+  "searchPlaceholder": "Search memory...",
+  "allCategories": "All Categories",
+  "clearSearch": "Clear",
+  "resultsFor": "results for",
+  "noSearchResults": "No results found",
+  "noEntries": "No memory entries yet",
+  "confirmDelete": "Delete",
+  "cancel": "Cancel",
+  "save": "Save",
+  "loadError": "Failed to load memory",
+  "storeError": "Failed to store entry",
+  "category": {
+    "core": "Core",
+    "daily": "Daily",
+    "conversation": "Conversation"
+  }
+}

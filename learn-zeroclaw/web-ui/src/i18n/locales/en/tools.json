@@ -1,0 +1,10 @@
+{
+  "title": "Tools",
+  "registered": "registered",
+  "searchPlaceholder": "Search tools...",
+  "noSearchResults": "No tools match your search",
+  "noTools": "No tools registered",
+  "description": "Description",
+  "parameters": "Parameters Schema",
+  "loadError": "Failed to load tools"
+}

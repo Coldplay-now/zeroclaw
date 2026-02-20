@@ -1,0 +1,15 @@
+{
+  "title": "Skills",
+  "installed": "installed",
+  "searchPlaceholder": "Search skills...",
+  "noSkills": "No skills installed",
+  "noResults": "No skills match your search",
+  "loadError": "Failed to load skills",
+  "tools": "tools",
+  "prompts": "prompts",
+  "author": "Author",
+  "toolsList": "Tools",
+  "promptsList": "Prompts",
+  "close": "Close",
+  "notFound": "Skill not found"
+}

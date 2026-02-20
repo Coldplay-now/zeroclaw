@@ -1,0 +1,21 @@
+{
+  "title": "ZeroClaw 仪表盘",
+  "status": "状态",
+  "model": "模型",
+  "memory": "记忆",
+  "autonomy": "自治",
+  "uptime": "运行时间",
+  "temp": "温度",
+  "entries": "条目",
+  "actsPerHour": "次/小时",
+  "componentHealth": "组件健康",
+  "restarts": "重启次数",
+  "quickStats": "快速统计",
+  "memoryEntries": "记忆条目",
+  "toolsRegistered": "已注册工具",
+  "cronJobs": "定时任务",
+  "cronActive": "运行中",
+  "totalRestarts": "总重启次数",
+  "observerBackend": "观测后端",
+  "noData": "--"
+}

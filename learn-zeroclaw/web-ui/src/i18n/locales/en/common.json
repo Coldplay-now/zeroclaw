@@ -1,0 +1,54 @@
+{
+  "nav": {
+    "dashboard": "Dashboard",
+    "chat": "Chat",
+    "prompts": "System Prompts",
+    "memory": "Memory",
+    "tools": "Tools",
+    "skills": "Skills",
+    "scheduler": "Scheduler",
+    "audit": "Audit Log",
+    "metrics": "Metrics",
+    "channels": "Channels",
+    "settings": "Settings",
+    "logout": "Logout"
+  },
+  "status": {
+    "ok": "OK",
+    "error": "Error",
+    "offline": "Offline",
+    "connecting": "Connecting...",
+    "online": "Online",
+    "comingSoon": "Coming Soon"
+  },
+  "actions": {
+    "save": "Save",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "edit": "Edit",
+    "create": "Create",
+    "confirm": "Confirm",
+    "search": "Search",
+    "refresh": "Refresh",
+    "loadMore": "Load more"
+  },
+  "time": {
+    "justNow": "just now",
+    "minutesAgo": "{{count}} min ago",
+    "hoursAgo": "{{count}}h ago",
+    "daysAgo": "{{count}}d ago"
+  },
+  "search": {
+    "placeholder": "Search pages and memory...",
+    "noResults": "No results found",
+    "pages": "Pages",
+    "memory": "Memory",
+    "navigate": "navigate",
+    "select": "select"
+  },
+  "errors": {
+    "gatewayOffline": "Gateway Offline",
+    "gatewayOfflineDesc": "Cannot reach ZeroClaw gateway",
+    "unauthorized": "Session expired. Please pair again."
+  }
+}

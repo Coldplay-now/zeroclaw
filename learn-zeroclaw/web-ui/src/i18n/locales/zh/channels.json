@@ -1,0 +1,9 @@
+{
+  "title": "通道",
+  "configured": "已配置",
+  "active": "活跃通道",
+  "unconfigured": "未配置",
+  "restarts": "次重启",
+  "loadError": "加载通道失败",
+  "configHint": "在 config.toml 中配置通道以启用。"
+}

@@ -1,0 +1,9 @@
+{
+  "title": "Channels",
+  "configured": "configured",
+  "active": "Active Channels",
+  "unconfigured": "Unconfigured",
+  "restarts": "restarts",
+  "loadError": "Failed to load channels",
+  "configHint": "Configure channels in config.toml to enable them."
+}

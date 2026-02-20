@@ -1,0 +1,14 @@
+{
+  "title": "Chat",
+  "placeholder": "Type a message...",
+  "send": "Send",
+  "thinking": "Thinking...",
+  "emptyHint": "Send a message to start chatting with ZeroClaw",
+  "disconnect": "Disconnect",
+  "toolCalls": "Tool Calls",
+  "duration": "Duration",
+  "ms": "ms",
+  "copy": "Copy",
+  "copied": "Copied!",
+  "errorReach": "Error: Cannot reach ZeroClaw gateway"
+}

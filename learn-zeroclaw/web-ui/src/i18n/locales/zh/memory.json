@@ -1,0 +1,27 @@
+{
+  "title": "记忆",
+  "addEntry": "添加条目",
+  "backend": "存储后端",
+  "totalEntries": "总条目数",
+  "health": "健康状态",
+  "healthy": "正常",
+  "unhealthy": "异常",
+  "keyPlaceholder": "记忆键名...",
+  "contentPlaceholder": "记忆内容...",
+  "searchPlaceholder": "搜索记忆...",
+  "allCategories": "全部分类",
+  "clearSearch": "清除",
+  "resultsFor": "条搜索结果，关键词",
+  "noSearchResults": "未找到结果",
+  "noEntries": "暂无记忆条目",
+  "confirmDelete": "删除",
+  "cancel": "取消",
+  "save": "保存",
+  "loadError": "加载记忆失败",
+  "storeError": "存储条目失败",
+  "category": {
+    "core": "核心",
+    "daily": "日常",
+    "conversation": "对话"
+  }
+}
