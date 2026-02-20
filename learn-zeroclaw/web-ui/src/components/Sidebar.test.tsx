@@ -40,7 +40,7 @@ describe("Sidebar", () => {
     renderSidebar();
     // 应该有多个 "Coming Soon" 标签
     const badges = screen.getAllByText("Coming Soon");
-    expect(badges.length).toBeGreaterThanOrEqual(9);
+    expect(badges.length).toBeGreaterThanOrEqual(8);
   });
 
   it("折叠/展开侧边栏", async () => {

@@ -1,0 +1,14 @@
+{
+  "title": "聊天",
+  "placeholder": "输入消息...",
+  "send": "发送",
+  "thinking": "思考中...",
+  "emptyHint": "发送消息开始与 ZeroClaw 对话",
+  "disconnect": "断开连接",
+  "toolCalls": "工具调用",
+  "duration": "耗时",
+  "ms": "毫秒",
+  "copy": "复制",
+  "copied": "已复制!",
+  "errorReach": "错误：无法连接 ZeroClaw 网关"
+}

@@ -37,9 +37,17 @@ export async function pair(
   return res.json();
 }
 
-export async function sendMessage(
-  message: string,
-): Promise<{ response?: string; model?: string; error?: string }> {
+// ── Chat / Webhook ─────────────────────────────────────────────────────────
+
+export interface MessageResponse {
+  response?: string;
+  model?: string;
+  tool_calls?: string[];
+  duration_ms?: number;
+  error?: string;
+}
+
+export async function sendMessage(message: string): Promise<MessageResponse> {
   return apiFetch("/webhook", {
     method: "POST",
     headers: {
@@ -49,6 +57,8 @@ export async function sendMessage(
     body: JSON.stringify({ message }),
   });
 }
+
+// ── Status ─────────────────────────────────────────────────────────────────
 
 export interface StatusResponse {
   version: string;
@@ -76,6 +86,69 @@ export interface StatusResponse {
 
 export async function getStatus(): Promise<StatusResponse> {
   return apiFetch("/status", {
+    headers: { ...authHeaders() },
+  });
+}
+
+// ── Prompts ────────────────────────────────────────────────────────────────
+
+export interface PromptFile {
+  filename: string;
+  exists: boolean;
+  role: string;
+  chars: number;
+  bytes: number;
+  updated_epoch: number | null;
+}
+
+export interface PromptsListResponse {
+  files: PromptFile[];
+  total_chars: number;
+  max_chars_per_file: number;
+}
+
+export interface PromptContentResponse {
+  filename: string;
+  content: string | null;
+  chars: number;
+  exists?: boolean;
+}
+
+export interface PromptPreviewResponse {
+  preview: string;
+  chars: number;
+}
+
+export async function getPrompts(): Promise<PromptsListResponse> {
+  return apiFetch("/prompts", {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function getPromptFile(
+  filename: string,
+): Promise<PromptContentResponse> {
+  return apiFetch(`/prompts/${encodeURIComponent(filename)}`, {
+    headers: { ...authHeaders() },
+  });
+}
+
+export async function updatePromptFile(
+  filename: string,
+  content: string,
+): Promise<{ filename: string; chars: number; saved: boolean }> {
+  return apiFetch(`/prompts/${encodeURIComponent(filename)}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(),
+    },
+    body: JSON.stringify({ content }),
+  });
+}
+
+export async function getPromptsPreview(): Promise<PromptPreviewResponse> {
+  return apiFetch("/prompts/preview", {
     headers: { ...authHeaders() },
   });
 }

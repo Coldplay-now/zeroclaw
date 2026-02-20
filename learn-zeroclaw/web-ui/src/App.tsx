@@ -4,6 +4,7 @@ import { Sidebar } from "@/components/Sidebar";
 import { PairingForm } from "@/components/PairingForm";
 import { Chat } from "@/components/Chat";
 import { Dashboard } from "@/pages/Dashboard";
+import { Prompts } from "@/pages/Prompts";
 import { ComingSoon } from "@/pages/ComingSoon";
 import "@/i18n";
 
@@ -63,18 +64,12 @@ function App() {
                     <Route
                       path="/chat"
                       element={
-                        <Chat
-                          token={localStorage.getItem("zeroclaw_token") || ""}
-                          onLogout={() => {
-                            localStorage.removeItem("zeroclaw_token");
-                            window.location.href = "/pair";
-                          }}
-                        />
+                        <Chat />
                       }
                     />
                     <Route
                       path="/prompts"
-                      element={<ComingSoon page="prompts" />}
+                      element={<Prompts />}
                     />
                     <Route
                       path="/memory"

@@ -542,6 +542,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", post(handle_whatsapp_message))
         // Management API (bearer token required)
         .route("/status", get(handle_status))
+        .route("/prompts", get(handle_prompts_list))
+        .route("/prompts/preview", get(handle_prompts_preview))
+        .route(
+            "/prompts/{filename}",
+            get(handle_prompts_get).put(handle_prompts_put),
+        )
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -659,6 +665,291 @@ fn fs_free_mb(path: &std::path::Path) -> Option<u64> {
     let line = stdout.lines().nth(1)?;
     let available_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
     Some(available_kb / 1024)
+}
+
+/// Extract tool names from an assistant history message.
+/// Handles both native tool-call format (JSON) and prompt-based XML tags.
+fn extract_tool_names_from_history(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+
+    // Native format: JSON with "tool_calls" array containing "function.name"
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(calls) = parsed.get("tool_calls").and_then(|v| v.as_array()) {
+            for call in calls {
+                if let Some(name) = call
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    // Prompt-based format: <tool_call>{"name": "..."}</tool_call>
+    for cap in content.match_indices("<tool_call>") {
+        let start = cap.0 + "<tool_call>".len();
+        if let Some(end) = content[start..].find("</tool_call>") {
+            let json_str = content[start..start + end].trim();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(name) = parsed.get("name").and_then(|n| n.as_str()) {
+                    if !names.contains(&name.to_string()) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    names
+}
+
+// ── Prompts API ──────────────────────────────────────────────────────────────
+
+/// Allowed workspace prompt filenames (whitelist).
+const PROMPT_FILES: &[&str] = &[
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "MEMORY.md",
+];
+
+/// Assembly order matches `src/agent/prompt.rs` IdentitySection::build().
+const PROMPT_ASSEMBLY_ORDER: &[&str] = &[
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "MEMORY.md",
+];
+
+/// Role descriptions for each prompt file.
+fn prompt_file_role(filename: &str) -> &'static str {
+    match filename {
+        "AGENTS.md" => "Session bootstrap instructions",
+        "SOUL.md" => "Core personality and values",
+        "TOOLS.md" => "Tool usage guidance",
+        "IDENTITY.md" => "Agent identity definition",
+        "USER.md" => "User profile and preferences",
+        "HEARTBEAT.md" => "Periodic heartbeat tasks",
+        "BOOTSTRAP.md" => "Custom bootstrap instructions",
+        "MEMORY.md" => "Long-term memory (agent-managed)",
+        _ => "Unknown",
+    }
+}
+
+/// GET /prompts — list all prompt files with metadata
+async fn handle_prompts_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let ws = config.workspace_dir.clone();
+    drop(config);
+
+    let mut files = Vec::new();
+    for &filename in PROMPT_ASSEMBLY_ORDER {
+        let path = ws.join(filename);
+        let (exists, chars, bytes, updated) = match std::fs::metadata(&path) {
+            Ok(meta) => {
+                let bytes = meta.len();
+                let chars = std::fs::read_to_string(&path)
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0);
+                let updated = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                (true, chars, bytes, updated)
+            }
+            Err(_) => (false, 0, 0, None),
+        };
+
+        files.push(serde_json::json!({
+            "filename": filename,
+            "exists": exists,
+            "role": prompt_file_role(filename),
+            "chars": chars,
+            "bytes": bytes,
+            "updated_epoch": updated,
+        }));
+    }
+
+    let total_chars: u64 = files.iter().filter_map(|f| f["chars"].as_u64()).sum();
+
+    let body = serde_json::json!({
+        "files": files,
+        "total_chars": total_chars,
+        "max_chars_per_file": 20_000,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+/// GET /prompts/:filename — return a single file's full content
+async fn handle_prompts_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    if !PROMPT_FILES.contains(&filename.as_str()) {
+        let err = serde_json::json!({
+            "error": format!("File not allowed: {filename}"),
+            "allowed": PROMPT_FILES,
+        });
+        return (StatusCode::FORBIDDEN, Json(err));
+    }
+
+    let config = state.config.lock();
+    let path = config.workspace_dir.join(&filename);
+    drop(config);
+
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let body = serde_json::json!({
+                "filename": filename,
+                "content": content,
+                "chars": content.chars().count(),
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let body = serde_json::json!({
+                "filename": filename,
+                "content": null,
+                "chars": 0,
+                "exists": false,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to read {filename}: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// Request body for PUT /prompts/:filename
+#[derive(serde::Deserialize)]
+struct PromptsUpdateBody {
+    content: String,
+}
+
+/// PUT /prompts/:filename — overwrite a prompt file
+async fn handle_prompts_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+    body: Result<Json<PromptsUpdateBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    if !PROMPT_FILES.contains(&filename.as_str()) {
+        let err = serde_json::json!({
+            "error": format!("File not allowed: {filename}"),
+            "allowed": PROMPT_FILES,
+        });
+        return (StatusCode::FORBIDDEN, Json(err));
+    }
+
+    let Json(update) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Invalid JSON body: {e}. Expected: {{\"content\": \"...\"}}")});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    // UTF-8 validation is implicit (Rust strings are always valid UTF-8).
+    // Check character limit.
+    let char_count = update.content.chars().count();
+    if char_count > 20_000 {
+        let err = serde_json::json!({
+            "error": format!("Content exceeds 20,000 character limit ({char_count} chars)"),
+            "chars": char_count,
+            "max_chars": 20_000,
+        });
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
+
+    let config = state.config.lock();
+    let path = config.workspace_dir.join(&filename);
+    drop(config);
+
+    match std::fs::write(&path, &update.content) {
+        Ok(()) => {
+            tracing::info!("Prompt file updated via API: {filename} ({char_count} chars)");
+            let body = serde_json::json!({
+                "filename": filename,
+                "chars": char_count,
+                "saved": true,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to write {filename}: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// GET /prompts/preview — assemble all prompt files in order, return merged text
+async fn handle_prompts_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let ws = config.workspace_dir.clone();
+    drop(config);
+
+    let mut assembled = String::new();
+    for &filename in PROMPT_ASSEMBLY_ORDER {
+        let path = ws.join(filename);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if !assembled.is_empty() {
+                assembled.push_str("\n\n");
+            }
+            let _ = writeln!(assembled, "--- {filename} ---");
+            // Truncate to match agent behavior (20,000 chars per file)
+            if content.chars().count() > 20_000 {
+                let truncated: String = content.chars().take(20_000).collect();
+                assembled.push_str(&truncated);
+                assembled.push_str("\n[... truncated at 20,000 chars]");
+            } else {
+                assembled.push_str(&content);
+            }
+        }
+    }
+
+    let body = serde_json::json!({
+        "preview": assembled,
+        "chars": assembled.chars().count(),
+    });
+
+    (StatusCode::OK, Json(body))
 }
 
 /// POST /pair — exchange one-time code for bearer token
@@ -836,6 +1127,8 @@ async fn handle_webhook(
 
     // Run full agent loop with tool support (120s timeout)
     const WEBHOOK_AGENT_TIMEOUT_SECS: u64 = 120;
+    let history_len_before = history.len();
+    let loop_start = Instant::now();
     let llm_result = tokio::time::timeout(
         Duration::from_secs(WEBHOOK_AGENT_TIMEOUT_SECS),
         run_tool_call_loop(
@@ -855,7 +1148,19 @@ async fn handle_webhook(
 
     match llm_result {
         Ok(Ok(response)) => {
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let elapsed_ms = u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            // Extract tool call names from history messages added during the loop.
+            let tool_calls: Vec<String> = history[history_len_before..]
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .flat_map(|m| extract_tool_names_from_history(&m.content))
+                .collect();
+            let body = serde_json::json!({
+                "response": response,
+                "model": state.model,
+                "tool_calls": tool_calls,
+                "duration_ms": elapsed_ms,
+            });
             (StatusCode::OK, Json(body))
         }
         Ok(Err(e)) => {

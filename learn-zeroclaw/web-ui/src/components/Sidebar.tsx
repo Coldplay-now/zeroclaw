@@ -30,7 +30,7 @@ interface NavItem {
 const navItems: NavItem[] = [
   { key: "dashboard", icon: LayoutDashboard, path: "/", enabled: true },
   { key: "chat", icon: MessageSquare, path: "/chat", enabled: true },
-  { key: "prompts", icon: FileText, path: "/prompts", enabled: false },
+  { key: "prompts", icon: FileText, path: "/prompts", enabled: true },
   { key: "memory", icon: Brain, path: "/memory", enabled: false },
   { key: "tools", icon: Wrench, path: "/tools", enabled: false },
   { key: "skills", icon: Puzzle, path: "/skills", enabled: false },
