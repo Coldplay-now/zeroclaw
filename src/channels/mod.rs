@@ -230,7 +230,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     }
 
     match llm_result {
-        Ok(Ok(response)) => {
+        Ok(Ok((response, _trace))) => {
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),

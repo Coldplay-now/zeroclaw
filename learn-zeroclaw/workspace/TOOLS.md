@@ -24,6 +24,8 @@ Skills define HOW tools work. This file is for YOUR specifics.
 - **cron_run** — Run a cron job immediately
 - **cron_runs** — List cron job run history
 - **delegate** — Delegate tasks to sub-agents
+- **web_search** — Search the web using Brave Search API. Returns titles, URLs, and descriptions of relevant web pages.
+- **email_send** — Send emails via SMTP
 
 ## Important Rules
 - The browser allowed_domains is set to `*` (wildcard). ALL websites are permitted. Do NOT refuse to open any URL — always call the tool and let the tool itself enforce restrictions if any.

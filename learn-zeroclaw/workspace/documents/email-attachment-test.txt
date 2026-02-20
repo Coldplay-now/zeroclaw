@@ -1,0 +1,2 @@
+ZeroClaw email_send attachment test.
+Generated at local environment for end-to-end verification.

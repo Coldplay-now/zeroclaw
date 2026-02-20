@@ -430,6 +430,27 @@ strip = true          # 去除符号
 
 ---
 
+## 14. 学习路径文档索引（已更新）
+
+为方便系统学习，建议按下面顺序阅读 `learn-zeroclaw/` 下文档：
+
+| 顺序 | 文档 | 目标 |
+|------|------|------|
+| 01 | `01-project-overview.md` | 建立全局架构地图 |
+| 02 | `02-deployment-guide.md` | 跑通部署与基础命令 |
+| 03 | `04-agent-loop.md` | 理解核心执行闭环（模型-工具-记忆） |
+| 04 | `05-provider-trait.md` | 理解模型抽象层、路由与可靠性机制 |
+| 05 | `06-channel-trait.md` | 理解消息通道抽象与多平台接入 |
+| 06 | `07-tool-trait.md` | 理解工具契约、注册与调用协议 |
+| 07 | `08-memory-trait.md` | 理解记忆后端与混合检索机制 |
+| 08 | `03-web-dashboard-prd.md` | 结合产品侧需求看落地目标 |
+| 09 | `04-web-dashboard-tasks.md` | 对照任务拆解进入实操 |
+| 10 | `05-web-dashboard-changelog.md` | 跟踪迭代记录与变更背景 |
+
+> 说明：学习文档会持续迭代，建议优先按本索引顺序阅读，后续再结合源码做深挖。
+
+---
+
 ## 总结
 
 ZeroClaw 不是简单的聊天机器人包装器，而是一个**生产级 AI Agent 基础设施**。它让 AI Agent 能够：

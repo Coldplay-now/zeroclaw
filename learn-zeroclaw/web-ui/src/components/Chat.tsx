@@ -5,8 +5,9 @@ import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { sendMessage, type MessageResponse } from "@/lib/api";
-import { Copy, Check, Wrench } from "lucide-react";
+import { sendMessage, type MessageResponse, type AgentTrace } from "@/lib/api";
+import { TraceInspector } from "@/components/TraceInspector";
+import { Copy, Check, Wrench, Layers } from "lucide-react";
 
 interface Message {
   role: "user" | "assistant";
@@ -14,6 +15,7 @@ interface Message {
   model?: string;
   toolCalls?: string[];
   durationMs?: number;
+  trace?: AgentTrace;
 }
 
 export function Chat() {
@@ -21,6 +23,7 @@ export function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -47,6 +50,7 @@ export function Chat() {
             model: result.model,
             toolCalls: result.tool_calls,
             durationMs: result.duration_ms,
+            trace: result.trace,
           },
         ]);
       } else {
@@ -68,53 +72,90 @@ export function Chat() {
     }
   };
 
-  return (
-    <div className="flex h-full flex-col">
-      {/* Messages */}
-      <ScrollArea className="flex-1 px-4">
-        <div className="mx-auto max-w-3xl space-y-4 py-4">
-          {messages.length === 0 && (
-            <p className="text-center text-muted-foreground pt-20">
-              {t("emptyHint")}
-            </p>
-          )}
-          {messages.map((msg, i) => (
-            <MessageBubble key={i} message={msg} />
-          ))}
-          {loading && (
-            <div className="flex justify-start">
-              <div className="bg-muted rounded-lg px-4 py-2 text-sm text-muted-foreground">
-                <span className="animate-pulse">{t("thinking")}</span>
-              </div>
-            </div>
-          )}
-          <div ref={bottomRef} />
-        </div>
-      </ScrollArea>
+  const selectedMessage =
+    selectedIndex !== null ? messages[selectedIndex] : null;
+  const hasInspector =
+    selectedMessage?.role === "assistant" && selectedMessage.trace;
 
-      {/* Input */}
-      <div className="border-t p-4">
-        <form
-          onSubmit={handleSend}
-          className="mx-auto flex max-w-3xl gap-2"
-        >
-          <Input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder={t("placeholder")}
-            disabled={loading}
-            autoFocus
-          />
-          <Button type="submit" disabled={!input.trim() || loading}>
-            {t("send")}
-          </Button>
-        </form>
+  return (
+    <div className="flex h-full">
+      {/* Chat column */}
+      <div className="flex flex-1 flex-col min-w-0">
+        {/* Messages */}
+        <ScrollArea className="flex-1 px-4">
+          <div className="mx-auto max-w-3xl space-y-4 py-4">
+            {messages.length === 0 && (
+              <p className="text-center text-muted-foreground pt-20">
+                {t("emptyHint")}
+              </p>
+            )}
+            {messages.map((msg, i) => (
+              <MessageBubble
+                key={i}
+                message={msg}
+                isSelected={selectedIndex === i}
+                onInspect={
+                  msg.role === "assistant" && msg.trace
+                    ? () =>
+                        setSelectedIndex(selectedIndex === i ? null : i)
+                    : undefined
+                }
+              />
+            ))}
+            {loading && (
+              <div className="flex justify-start">
+                <div className="bg-muted rounded-lg px-4 py-2 text-sm text-muted-foreground">
+                  <span className="animate-pulse">{t("thinking")}</span>
+                </div>
+              </div>
+            )}
+            <div ref={bottomRef} />
+          </div>
+        </ScrollArea>
+
+        {/* Input */}
+        <div className="border-t p-4">
+          <form
+            onSubmit={handleSend}
+            className="mx-auto flex max-w-3xl gap-2"
+          >
+            <Input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={t("placeholder")}
+              disabled={loading}
+              autoFocus
+            />
+            <Button type="submit" disabled={!input.trim() || loading}>
+              {t("send")}
+            </Button>
+          </form>
+        </div>
       </div>
+
+      {/* Inspector panel */}
+      {hasInspector && selectedMessage.trace && (
+        <div className="w-[380px] shrink-0">
+          <TraceInspector
+            trace={selectedMessage.trace}
+            model={selectedMessage.model}
+            onClose={() => setSelectedIndex(null)}
+          />
+        </div>
+      )}
     </div>
   );
 }
 
-function MessageBubble({ message }: { message: Message }) {
+function MessageBubble({
+  message,
+  isSelected,
+  onInspect,
+}: {
+  message: Message;
+  isSelected: boolean;
+  onInspect?: () => void;
+}) {
   const { t } = useTranslation("chat");
   const isUser = message.role === "user";
 
@@ -125,7 +166,7 @@ function MessageBubble({ message }: { message: Message }) {
           isUser
             ? "bg-primary text-primary-foreground"
             : "bg-muted text-foreground"
-        }`}
+        } ${isSelected ? "ring-2 ring-primary/50" : ""}`}
       >
         {isUser ? (
           <span className="whitespace-pre-wrap">{message.content}</span>
@@ -133,24 +174,43 @@ function MessageBubble({ message }: { message: Message }) {
           <AssistantContent message={message} />
         )}
         {/* Metadata footer */}
-        {!isUser && (message.model || message.toolCalls?.length || message.durationMs) && (
-          <div className="flex flex-wrap items-center gap-2 mt-2 pt-1 border-t border-foreground/10">
-            {message.toolCalls && message.toolCalls.length > 0 && (
-              <span className="inline-flex items-center gap-1 text-xs opacity-60">
-                <Wrench className="h-3 w-3" />
-                {message.toolCalls.join(", ")}
-              </span>
-            )}
-            {message.model && (
-              <span className="text-xs opacity-50">{message.model}</span>
-            )}
-            {message.durationMs != null && (
-              <span className="text-xs opacity-50">
-                {message.durationMs}{t("ms")}
-              </span>
-            )}
-          </div>
-        )}
+        {!isUser &&
+          (message.model ||
+            message.toolCalls?.length ||
+            message.durationMs ||
+            message.trace) && (
+            <div className="flex flex-wrap items-center gap-2 mt-2 pt-1 border-t border-foreground/10">
+              {message.toolCalls && message.toolCalls.length > 0 && (
+                <span className="inline-flex items-center gap-1 text-xs opacity-60">
+                  <Wrench className="h-3 w-3" />
+                  {message.toolCalls.join(", ")}
+                </span>
+              )}
+              {message.model && (
+                <span className="text-xs opacity-50">{message.model}</span>
+              )}
+              {message.durationMs != null && (
+                <span className="text-xs opacity-50">
+                  {message.durationMs}
+                  {t("ms")}
+                </span>
+              )}
+              {onInspect && (
+                <button
+                  onClick={onInspect}
+                  className={`inline-flex items-center gap-1 text-xs transition-colors rounded px-1.5 py-0.5 ${
+                    isSelected
+                      ? "bg-primary/10 text-primary"
+                      : "opacity-50 hover:opacity-100 hover:bg-foreground/5"
+                  }`}
+                  title={t("inspector.title", "Interaction Inspector")}
+                >
+                  <Layers className="h-3 w-3" />
+                  {t("inspector.inspect", "Inspect")}
+                </button>
+              )}
+            </div>
+          )}
       </div>
     </div>
   );

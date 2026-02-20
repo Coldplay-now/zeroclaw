@@ -14,6 +14,7 @@ services:
       - PROVIDER=${PROVIDER:-openrouter}
       - ZEROCLAW_MODEL=
       - ZEROCLAW_GATEWAY_PORT=3000
+      - EMAIL_TOOL_PASSWORD=${EMAIL_TOOL_PASSWORD:-}
     depends_on:
       chrome:
         condition: service_healthy

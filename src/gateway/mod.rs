@@ -10,13 +10,13 @@
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
+use crate::cron;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::cron;
 use crate::skills;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
@@ -1205,10 +1205,7 @@ async fn handle_memory_delete(
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// GET /tools — list all registered tools
-async fn handle_tools_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_tools_list(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(resp) = verify_bearer_token(&state, &headers) {
         return resp;
     }
@@ -1265,10 +1262,7 @@ async fn handle_tools_get(
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// GET /cron/jobs — list all cron jobs
-async fn handle_cron_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_cron_list(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(resp) = verify_bearer_token(&state, &headers) {
         return resp;
     }
@@ -1608,10 +1602,7 @@ async fn handle_audit_logs(
 /// returns what is available from the health system and basic system counters.
 /// For full time-series metrics, configure the "otel" observer backend with an
 /// external collector (Prometheus, Grafana, etc.).
-async fn handle_metrics(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_metrics(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(resp) = verify_bearer_token(&state, &headers) {
         return resp;
     }
@@ -1748,10 +1739,7 @@ async fn handle_skills_get(
 }
 
 /// GET /config — return sanitized config (sensitive fields masked)
-async fn handle_config_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_config_get(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(resp) = verify_bearer_token(&state, &headers) {
         return resp;
     }
@@ -1793,6 +1781,16 @@ async fn handle_config_get(
             "daily_limit_usd": config.cost.daily_limit_usd,
             "monthly_limit_usd": config.cost.monthly_limit_usd,
             "warn_at_percent": config.cost.warn_at_percent,
+        },
+        "email_tool": {
+            "enabled": config.email_tool.enabled,
+            "smtp_host": &config.email_tool.smtp_host,
+            "smtp_port": config.email_tool.smtp_port,
+            "smtp_tls": config.email_tool.smtp_tls,
+            "username": &config.email_tool.username,
+            "password": if config.email_tool.password.is_empty() { "" } else { "***" },
+            "from_address": &config.email_tool.from_address,
+            "allowed_recipients": &config.email_tool.allowed_recipients,
         },
         "agent": {
             "max_tool_iterations": config.agent.max_tool_iterations,
@@ -1857,11 +1855,9 @@ async fn handle_config_patch(
             }
             "autonomy_level" => {
                 if let Some(v) = value.as_str() {
-                    if let Ok(level) =
-                        serde_json::from_value::<crate::security::AutonomyLevel>(
-                            serde_json::Value::String(v.to_string()),
-                        )
-                    {
+                    if let Ok(level) = serde_json::from_value::<crate::security::AutonomyLevel>(
+                        serde_json::Value::String(v.to_string()),
+                    ) {
                         config.autonomy.level = level;
                         updated.push(key.clone());
                     }
@@ -2150,7 +2146,7 @@ async fn handle_webhook(
     .await;
 
     match llm_result {
-        Ok(Ok(response)) => {
+        Ok(Ok((response, trace))) => {
             let elapsed_ms = u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
             // Extract tool call names from history messages added during the loop.
             let tool_calls: Vec<String> = history[history_len_before..]
@@ -2163,6 +2159,7 @@ async fn handle_webhook(
                 "model": state.model,
                 "tool_calls": tool_calls,
                 "duration_ms": elapsed_ms,
+                "trace": trace,
             });
             (StatusCode::OK, Json(body))
         }
