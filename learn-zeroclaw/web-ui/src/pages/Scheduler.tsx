@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -193,6 +193,92 @@ export function Scheduler() {
   );
 }
 
+type ScheduleMode = "quick" | "advanced";
+type QuickPreset = "hourly" | "daily" | "weekdays" | "weekly" | "every_minutes";
+
+function buildCronFromPreset(
+  preset: QuickPreset,
+  hour: number,
+  minute: number,
+  weekday: number,
+  everyMinutes: number,
+): string {
+  const h = Math.max(0, Math.min(23, hour));
+  const m = Math.max(0, Math.min(59, minute));
+  const wd = Math.max(0, Math.min(6, weekday));
+  const interval = Math.max(1, Math.min(59, everyMinutes));
+
+  switch (preset) {
+    case "hourly":
+      return `${m} * * * *`;
+    case "daily":
+      return `${m} ${h} * * *`;
+    case "weekdays":
+      return `${m} ${h} * * 1-5`;
+    case "weekly":
+      return `${m} ${h} * * ${wd}`;
+    case "every_minutes":
+      return `*/${interval} * * * *`;
+    default:
+      return "0 * * * *";
+  }
+}
+
+function validateCronExpression(expr: string): string | null {
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) return "cronFormatError";
+
+  const token = /^(\*|\*\/\d+|\d+|\d+-\d+|\d+(,\d+)+)$/;
+  if (!parts.every((p) => token.test(p))) return "cronTokenError";
+  return null;
+}
+
+function nextRunFromPreset(
+  preset: QuickPreset,
+  hour: number,
+  minute: number,
+  weekday: number,
+  everyMinutes: number,
+): Date {
+  const now = new Date();
+  const next = new Date(now);
+  next.setSeconds(0, 0);
+
+  if (preset === "every_minutes") {
+    const interval = Math.max(1, Math.min(59, everyMinutes));
+    const mins = next.getMinutes();
+    const delta = interval - (mins % interval || interval);
+    next.setMinutes(mins + delta);
+    return next;
+  }
+
+  if (preset === "hourly") {
+    next.setMinutes(minute, 0, 0);
+    if (next <= now) next.setHours(next.getHours() + 1);
+    return next;
+  }
+
+  next.setHours(hour, minute, 0, 0);
+  if (preset === "daily") {
+    if (next <= now) next.setDate(next.getDate() + 1);
+    return next;
+  }
+
+  if (preset === "weekdays") {
+    while (next <= now || next.getDay() === 0 || next.getDay() === 6) {
+      next.setDate(next.getDate() + 1);
+      next.setHours(hour, minute, 0, 0);
+    }
+    return next;
+  }
+
+  while (next <= now || next.getDay() !== weekday) {
+    next.setDate(next.getDate() + 1);
+    next.setHours(hour, minute, 0, 0);
+  }
+  return next;
+}
+
 function JobCard({
   job,
   isExpanded,
@@ -315,6 +401,8 @@ function JobCard({
               <span>{t("session")}: {job.session_target}</span>
               {job.model && <span>{t("model")}: {job.model}</span>}
               <span>{t("delivery")}: {job.delivery.mode}</span>
+              {job.delivery.channel && <span>{t("channel")}: {job.delivery.channel}</span>}
+              {job.delivery.to && <span>{t("target")}: {job.delivery.to}</span>}
             </div>
             {job.last_output && (
               <div className="mt-2">
@@ -340,10 +428,35 @@ function CreateJobForm({
 }) {
   const { t } = useTranslation("scheduler");
   const [jobType, setJobType] = useState<"shell" | "agent">("agent");
+  const [scheduleMode, setScheduleMode] = useState<ScheduleMode>("quick");
+  const [quickPreset, setQuickPreset] = useState<QuickPreset>("hourly");
+  const [hour, setHour] = useState(9);
+  const [minute, setMinute] = useState(0);
+  const [weekday, setWeekday] = useState(1);
+  const [everyMinutes, setEveryMinutes] = useState(15);
   const [name, setName] = useState("");
   const [cronExpr, setCronExpr] = useState("0 * * * *");
   const [command, setCommand] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [deliveryMode, setDeliveryMode] = useState<"none" | "announce">("none");
+  const [deliveryChannel, setDeliveryChannel] = useState<"telegram" | "discord" | "slack">(
+    "telegram",
+  );
+  const [deliveryTarget, setDeliveryTarget] = useState("");
+  const [deliveryBestEffort, setDeliveryBestEffort] = useState(true);
+
+  useEffect(() => {
+    if (scheduleMode === "quick") {
+      setCronExpr(buildCronFromPreset(quickPreset, hour, minute, weekday, everyMinutes));
+    }
+  }, [scheduleMode, quickPreset, hour, minute, weekday, everyMinutes]);
+
+  const cronErrorKey = useMemo(() => validateCronExpression(cronExpr), [cronExpr]);
+  const timezone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone, []);
+  const nextRunPreview = useMemo(() => {
+    if (scheduleMode !== "quick") return null;
+    return nextRunFromPreset(quickPreset, hour, minute, weekday, everyMinutes).toLocaleString();
+  }, [scheduleMode, quickPreset, hour, minute, weekday, everyMinutes]);
 
   const createMutation = useMutation({
     mutationFn: (body: Record<string, unknown>) => createCronJob(body),
@@ -355,6 +468,18 @@ function CreateJobForm({
       schedule: { kind: "cron", expr: cronExpr },
       job_type: jobType,
       name: name || undefined,
+      delivery:
+        deliveryMode === "announce"
+          ? {
+              mode: "announce",
+              channel: deliveryChannel,
+              to: deliveryTarget.trim(),
+              best_effort: deliveryBestEffort,
+            }
+          : {
+              mode: "none",
+              best_effort: true,
+            },
     };
     if (jobType === "shell") body.command = command;
     else body.prompt = prompt;
@@ -390,13 +515,172 @@ function CreateJobForm({
             <option value="shell">{t("typeShell")}</option>
           </select>
         </div>
-        <input
-          type="text"
-          placeholder={t("cronExpression")}
-          value={cronExpr}
-          onChange={(e) => setCronExpr(e.target.value)}
-          className="w-full p-2 rounded border bg-background text-sm font-mono focus:outline-none focus:ring-2 focus:ring-ring"
-        />
+        <div className="rounded border p-3 space-y-3">
+          <div className="flex gap-2">
+            <Button
+              variant={scheduleMode === "quick" ? "default" : "outline"}
+              size="sm"
+              onClick={() => setScheduleMode("quick")}
+            >
+              {t("quickMode")}
+            </Button>
+            <Button
+              variant={scheduleMode === "advanced" ? "default" : "outline"}
+              size="sm"
+              onClick={() => setScheduleMode("advanced")}
+            >
+              {t("advancedMode")}
+            </Button>
+          </div>
+
+          {scheduleMode === "quick" && (
+            <div className="space-y-2">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                <select
+                  value={quickPreset}
+                  onChange={(e) => setQuickPreset(e.target.value as QuickPreset)}
+                  className="p-2 rounded border bg-background text-sm"
+                >
+                  <option value="hourly">{t("presetHourly")}</option>
+                  <option value="daily">{t("presetDaily")}</option>
+                  <option value="weekdays">{t("presetWeekdays")}</option>
+                  <option value="weekly">{t("presetWeekly")}</option>
+                  <option value="every_minutes">{t("presetEveryMinutes")}</option>
+                </select>
+
+                {quickPreset === "every_minutes" ? (
+                  <input
+                    type="number"
+                    min={1}
+                    max={59}
+                    value={everyMinutes}
+                    onChange={(e) => setEveryMinutes(Number(e.target.value || 1))}
+                    className="p-2 rounded border bg-background text-sm"
+                    placeholder={t("everyMinutes")}
+                  />
+                ) : quickPreset === "hourly" ? (
+                  <div className="space-y-1">
+                    <input
+                      type="number"
+                      min={0}
+                      max={59}
+                      value={minute}
+                      onChange={(e) => setMinute(Number(e.target.value || 0))}
+                      className="p-2 rounded border bg-background text-sm w-full"
+                      placeholder={t("minute")}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {t("hourlyMinuteHint")}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-2">
+                    <input
+                      type="number"
+                      min={0}
+                      max={23}
+                      value={hour}
+                      onChange={(e) => setHour(Number(e.target.value || 0))}
+                      className="p-2 rounded border bg-background text-sm"
+                      placeholder={t("hour")}
+                    />
+                    <input
+                      type="number"
+                      min={0}
+                      max={59}
+                      value={minute}
+                      onChange={(e) => setMinute(Number(e.target.value || 0))}
+                      className="p-2 rounded border bg-background text-sm"
+                      placeholder={t("minute")}
+                    />
+                  </div>
+                )}
+              </div>
+
+              {quickPreset === "weekly" && (
+                <select
+                  value={weekday}
+                  onChange={(e) => setWeekday(Number(e.target.value))}
+                  className="p-2 rounded border bg-background text-sm"
+                >
+                  <option value={0}>{t("weekdaySun")}</option>
+                  <option value={1}>{t("weekdayMon")}</option>
+                  <option value={2}>{t("weekdayTue")}</option>
+                  <option value={3}>{t("weekdayWed")}</option>
+                  <option value={4}>{t("weekdayThu")}</option>
+                  <option value={5}>{t("weekdayFri")}</option>
+                  <option value={6}>{t("weekdaySat")}</option>
+                </select>
+              )}
+
+              <p className="text-xs text-muted-foreground">
+                {t("timezone")}: {timezone}
+              </p>
+              {nextRunPreview && (
+                <p className="text-xs text-muted-foreground">
+                  {t("nextRunPreview")}: {nextRunPreview}
+                </p>
+              )}
+            </div>
+          )}
+
+          <input
+            type="text"
+            placeholder={t("cronExpression")}
+            value={cronExpr}
+            onChange={(e) => setCronExpr(e.target.value)}
+            readOnly={scheduleMode === "quick"}
+            className="w-full p-2 rounded border bg-background text-sm font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+          />
+          {cronErrorKey && (
+            <p className="text-xs text-destructive">{t(cronErrorKey)}</p>
+          )}
+        </div>
+        <div className="rounded border p-3 space-y-3">
+          <p className="text-sm font-medium">{t("deliverySettings")}</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <select
+              value={deliveryMode}
+              onChange={(e) => setDeliveryMode(e.target.value as "none" | "announce")}
+              className="p-2 rounded border bg-background text-sm"
+            >
+              <option value="none">{t("deliveryNone")}</option>
+              <option value="announce">{t("deliveryAnnounce")}</option>
+            </select>
+            {deliveryMode === "announce" && (
+              <select
+                value={deliveryChannel}
+                onChange={(e) =>
+                  setDeliveryChannel(e.target.value as "telegram" | "discord" | "slack")
+                }
+                className="p-2 rounded border bg-background text-sm"
+              >
+                <option value="telegram">Telegram</option>
+                <option value="discord">Discord</option>
+                <option value="slack">Slack</option>
+              </select>
+            )}
+          </div>
+          {deliveryMode === "announce" && (
+            <>
+              <input
+                type="text"
+                placeholder={t("deliveryTargetPlaceholder")}
+                value={deliveryTarget}
+                onChange={(e) => setDeliveryTarget(e.target.value)}
+                className="w-full p-2 rounded border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={deliveryBestEffort}
+                  onChange={(e) => setDeliveryBestEffort(e.target.checked)}
+                />
+                {t("deliveryBestEffort")}
+              </label>
+            </>
+          )}
+        </div>
         {jobType === "shell" ? (
           <input
             type="text"
@@ -422,6 +706,8 @@ function CreateJobForm({
             onClick={handleCreate}
             disabled={
               createMutation.isPending ||
+              !!cronErrorKey ||
+              (deliveryMode === "announce" && !deliveryTarget.trim()) ||
               (!command && jobType === "shell") ||
               (!prompt && jobType === "agent")
             }
