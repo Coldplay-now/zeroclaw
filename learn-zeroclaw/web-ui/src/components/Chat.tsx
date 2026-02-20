@@ -16,7 +16,7 @@ interface Props {
   onLogout: () => void;
 }
 
-export function Chat({ token, onLogout }: Props) {
+export function Chat({ token: _token, onLogout }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -36,7 +36,7 @@ export function Chat({ token, onLogout }: Props) {
     setLoading(true);
 
     try {
-      const result = await sendMessage(text, token);
+      const result = await sendMessage(text);
       if (result.response) {
         setMessages((prev) => [
           ...prev,

@@ -1,57 +1,123 @@
-import { useState, useEffect } from "react";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Sidebar } from "@/components/Sidebar";
 import { PairingForm } from "@/components/PairingForm";
 import { Chat } from "@/components/Chat";
-import { healthCheck } from "@/lib/api";
+import { Dashboard } from "@/pages/Dashboard";
+import { ComingSoon } from "@/pages/ComingSoon";
+import "@/i18n";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: 1,
+      staleTime: 5_000,
+    },
+  },
+});
+
+function isAuthenticated(): boolean {
+  return !!localStorage.getItem("zeroclaw_token");
+}
+
+function RequireAuth({ children }: { children: React.ReactNode }) {
+  if (!isAuthenticated()) {
+    return <Navigate to="/pair" replace />;
+  }
+  return <>{children}</>;
+}
+
+function DashboardLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex h-screen bg-background">
+      <Sidebar />
+      <main className="flex-1 overflow-y-auto">{children}</main>
+    </div>
+  );
+}
+
+function PairPage() {
+  return (
+    <PairingForm
+      onPaired={(token) => {
+        localStorage.setItem("zeroclaw_token", token);
+        window.location.href = "/";
+      }}
+    />
+  );
+}
 
 function App() {
-  const [token, setToken] = useState<string | null>(
-    () => localStorage.getItem("zeroclaw_token"),
+  return (
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/pair" element={<PairPage />} />
+          <Route
+            path="/*"
+            element={
+              <RequireAuth>
+                <DashboardLayout>
+                  <Routes>
+                    <Route path="/" element={<Dashboard />} />
+                    <Route
+                      path="/chat"
+                      element={
+                        <Chat
+                          token={localStorage.getItem("zeroclaw_token") || ""}
+                          onLogout={() => {
+                            localStorage.removeItem("zeroclaw_token");
+                            window.location.href = "/pair";
+                          }}
+                        />
+                      }
+                    />
+                    <Route
+                      path="/prompts"
+                      element={<ComingSoon page="prompts" />}
+                    />
+                    <Route
+                      path="/memory"
+                      element={<ComingSoon page="memory" />}
+                    />
+                    <Route
+                      path="/tools"
+                      element={<ComingSoon page="tools" />}
+                    />
+                    <Route
+                      path="/skills"
+                      element={<ComingSoon page="skills" />}
+                    />
+                    <Route
+                      path="/scheduler"
+                      element={<ComingSoon page="scheduler" />}
+                    />
+                    <Route
+                      path="/audit"
+                      element={<ComingSoon page="audit" />}
+                    />
+                    <Route
+                      path="/metrics"
+                      element={<ComingSoon page="metrics" />}
+                    />
+                    <Route
+                      path="/channels"
+                      element={<ComingSoon page="channels" />}
+                    />
+                    <Route
+                      path="/settings"
+                      element={<ComingSoon page="settings" />}
+                    />
+                    <Route path="*" element={<Navigate to="/" replace />} />
+                  </Routes>
+                </DashboardLayout>
+              </RequireAuth>
+            }
+          />
+        </Routes>
+      </BrowserRouter>
+    </QueryClientProvider>
   );
-  const [gatewayUp, setGatewayUp] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    healthCheck()
-      .then(() => setGatewayUp(true))
-      .catch(() => setGatewayUp(false));
-  }, []);
-
-  const handleLogout = () => {
-    localStorage.removeItem("zeroclaw_token");
-    setToken(null);
-  };
-
-  if (gatewayUp === false) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-background">
-        <div className="text-center space-y-2">
-          <p className="text-lg font-semibold text-destructive">Gateway Offline</p>
-          <p className="text-sm text-muted-foreground">
-            Cannot reach ZeroClaw at{" "}
-            <code className="bg-muted px-1 rounded">
-              {import.meta.env.VITE_API_URL ?? "http://localhost:3000"}
-            </code>
-          </p>
-          <p className="text-sm text-muted-foreground">
-            Make sure <code className="bg-muted px-1 rounded">docker compose up</code> is running.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  if (gatewayUp === null) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-background">
-        <p className="text-muted-foreground animate-pulse">Connecting to ZeroClaw...</p>
-      </div>
-    );
-  }
-
-  if (!token) {
-    return <PairingForm onPaired={setToken} />;
-  }
-
-  return <Chat token={token} onLogout={handleLogout} />;
 }
 
 export default App;

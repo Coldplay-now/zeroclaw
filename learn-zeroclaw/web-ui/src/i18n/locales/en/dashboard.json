@@ -1,0 +1,21 @@
+{
+  "title": "ZeroClaw Dashboard",
+  "status": "Status",
+  "model": "Model",
+  "memory": "Memory",
+  "autonomy": "Autonomy",
+  "uptime": "uptime",
+  "temp": "temp",
+  "entries": "entries",
+  "actsPerHour": "acts/hr",
+  "componentHealth": "Component Health",
+  "restarts": "restarts",
+  "quickStats": "Quick Stats (last 24h)",
+  "llmRequests": "LLM Requests",
+  "tokenUsage": "Tokens",
+  "toolCalls": "Tool Calls",
+  "cost": "Cost",
+  "errors": "Errors",
+  "avgLatency": "Avg Latency",
+  "noData": "--"
+}

@@ -1,0 +1,21 @@
+{
+  "title": "ZeroClaw 仪表盘",
+  "status": "状态",
+  "model": "模型",
+  "memory": "记忆",
+  "autonomy": "自治",
+  "uptime": "运行时间",
+  "temp": "温度",
+  "entries": "条目",
+  "actsPerHour": "次/小时",
+  "componentHealth": "组件健康",
+  "restarts": "重启次数",
+  "quickStats": "快速统计 (近 24h)",
+  "llmRequests": "LLM 请求",
+  "tokenUsage": "Token 用量",
+  "toolCalls": "工具调用",
+  "cost": "费用",
+  "errors": "错误",
+  "avgLatency": "平均延迟",
+  "noData": "--"
+}

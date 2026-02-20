@@ -1,0 +1,46 @@
+{
+  "nav": {
+    "dashboard": "仪表盘",
+    "chat": "对话",
+    "prompts": "系统提示词",
+    "memory": "记忆",
+    "tools": "工具",
+    "skills": "技能",
+    "scheduler": "定时任务",
+    "audit": "审计日志",
+    "metrics": "监控面板",
+    "channels": "通道",
+    "settings": "设置",
+    "logout": "退出登录"
+  },
+  "status": {
+    "ok": "正常",
+    "error": "异常",
+    "offline": "离线",
+    "connecting": "连接中...",
+    "online": "在线",
+    "comingSoon": "即将推出"
+  },
+  "actions": {
+    "save": "保存",
+    "cancel": "取消",
+    "delete": "删除",
+    "edit": "编辑",
+    "create": "新建",
+    "confirm": "确认",
+    "search": "搜索",
+    "refresh": "刷新",
+    "loadMore": "加载更多"
+  },
+  "time": {
+    "justNow": "刚刚",
+    "minutesAgo": "{{count}} 分钟前",
+    "hoursAgo": "{{count}} 小时前",
+    "daysAgo": "{{count}} 天前"
+  },
+  "errors": {
+    "gatewayOffline": "网关离线",
+    "gatewayOfflineDesc": "无法连接 ZeroClaw 网关",
+    "unauthorized": "会话已过期，请重新配对。"
+  }
+}
