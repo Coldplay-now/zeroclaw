@@ -9,11 +9,42 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use serde::Serialize;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
+
+/// A single step in the agent loop, used to build an execution trace.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum AgentStep {
+    LlmRequest {
+        provider: String,
+        model: String,
+        messages_count: usize,
+        duration_ms: u64,
+        success: bool,
+        error: Option<String>,
+        response_preview: Option<String>,
+    },
+    ToolCall {
+        tool: String,
+        arguments: serde_json::Value,
+        output_preview: String,
+        duration_ms: u64,
+        success: bool,
+    },
+}
+
+/// Execution trace for a complete agent loop run.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AgentTrace {
+    pub steps: Vec<AgentStep>,
+    pub total_duration_ms: u64,
+    pub iterations: usize,
+}
 
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 const MAX_TOOL_ITERATIONS: usize = 10;
@@ -70,6 +101,13 @@ fn scrub_credentials(input: &str) -> String {
             }
         })
         .to_string()
+}
+
+/// Scrub credentials from a JSON value by serializing to string, scrubbing, and re-parsing.
+fn scrub_credentials_json(value: &serde_json::Value) -> serde_json::Value {
+    let raw = value.to_string();
+    let scrubbed = scrub_credentials(&raw);
+    serde_json::from_str(&scrubbed).unwrap_or_else(|_| serde_json::Value::String(scrubbed))
 }
 
 /// Trigger auto-compaction when non-system message count exceeds this threshold.
@@ -594,7 +632,7 @@ pub(crate) async fn agent_turn(
     temperature: f64,
     silent: bool,
 ) -> Result<String> {
-    run_tool_call_loop(
+    let (response, _trace) = run_tool_call_loop(
         provider,
         history,
         tools_registry,
@@ -606,7 +644,8 @@ pub(crate) async fn agent_turn(
         None,
         "channel",
     )
-    .await
+    .await?;
+    Ok(response)
 }
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
@@ -623,7 +662,10 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
-) -> Result<String> {
+) -> Result<(String, AgentTrace)> {
+    let loop_start = Instant::now();
+    let mut trace = AgentTrace::default();
+
     // Build native tool definitions once if the provider supports them.
     let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
     let tool_definitions = if use_native_tools {
@@ -632,11 +674,17 @@ pub(crate) async fn run_tool_call_loop(
         Vec::new()
     };
 
-    for _iteration in 0..MAX_TOOL_ITERATIONS {
+    /// Max characters kept in `response_preview` for LLM steps.
+    const RESPONSE_PREVIEW_LIMIT: usize = 200;
+    /// Max characters kept in `output_preview` for tool steps.
+    const OUTPUT_PREVIEW_LIMIT: usize = 500;
+
+    for iteration in 0..MAX_TOOL_ITERATIONS {
+        let messages_count = history.len();
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
-            messages_count: history.len(),
+            messages_count,
         });
 
         let llm_started_at = Instant::now();
@@ -651,14 +699,30 @@ pub(crate) async fn run_tool_call_loop(
                     .await
                 {
                     Ok(resp) => {
+                        let llm_duration = llm_started_at.elapsed();
                         observer.record_event(&ObserverEvent::LlmResponse {
                             provider: provider_name.to_string(),
                             model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
+                            duration: llm_duration,
                             success: true,
                             error_message: None,
                         });
                         let response_text = resp.text_or_empty().to_string();
+
+                        trace.steps.push(AgentStep::LlmRequest {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            messages_count,
+                            duration_ms: u64::try_from(llm_duration.as_millis())
+                                .unwrap_or(u64::MAX),
+                            success: true,
+                            error: None,
+                            response_preview: Some(truncate_with_ellipsis(
+                                &response_text,
+                                RESPONSE_PREVIEW_LIMIT,
+                            )),
+                        });
+
                         let mut calls = parse_structured_tool_calls(&resp.tool_calls);
                         let mut parsed_text = String::new();
 
@@ -688,15 +752,28 @@ pub(crate) async fn run_tool_call_loop(
                         )
                     }
                     Err(e) => {
+                        let llm_duration = llm_started_at.elapsed();
+                        let sanitized = crate::providers::sanitize_api_error(&e.to_string());
                         observer.record_event(&ObserverEvent::LlmResponse {
                             provider: provider_name.to_string(),
                             model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
+                            duration: llm_duration,
                             success: false,
-                            error_message: Some(crate::providers::sanitize_api_error(
-                                &e.to_string(),
-                            )),
+                            error_message: Some(sanitized.clone()),
                         });
+                        trace.steps.push(AgentStep::LlmRequest {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            messages_count,
+                            duration_ms: u64::try_from(llm_duration.as_millis())
+                                .unwrap_or(u64::MAX),
+                            success: false,
+                            error: Some(sanitized),
+                            response_preview: None,
+                        });
+                        trace.iterations = iteration + 1;
+                        trace.total_duration_ms =
+                            u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
                         return Err(e);
                     }
                 }
@@ -706,14 +783,30 @@ pub(crate) async fn run_tool_call_loop(
                     .await
                 {
                     Ok(resp) => {
+                        let llm_duration = llm_started_at.elapsed();
                         observer.record_event(&ObserverEvent::LlmResponse {
                             provider: provider_name.to_string(),
                             model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
+                            duration: llm_duration,
                             success: true,
                             error_message: None,
                         });
                         let response_text = resp;
+
+                        trace.steps.push(AgentStep::LlmRequest {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            messages_count,
+                            duration_ms: u64::try_from(llm_duration.as_millis())
+                                .unwrap_or(u64::MAX),
+                            success: true,
+                            error: None,
+                            response_preview: Some(truncate_with_ellipsis(
+                                &response_text,
+                                RESPONSE_PREVIEW_LIMIT,
+                            )),
+                        });
+
                         let assistant_history_content = response_text.clone();
                         let (parsed_text, calls) = parse_tool_calls(&response_text);
                         (
@@ -725,15 +818,28 @@ pub(crate) async fn run_tool_call_loop(
                         )
                     }
                     Err(e) => {
+                        let llm_duration = llm_started_at.elapsed();
+                        let sanitized = crate::providers::sanitize_api_error(&e.to_string());
                         observer.record_event(&ObserverEvent::LlmResponse {
                             provider: provider_name.to_string(),
                             model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
+                            duration: llm_duration,
                             success: false,
-                            error_message: Some(crate::providers::sanitize_api_error(
-                                &e.to_string(),
-                            )),
+                            error_message: Some(sanitized.clone()),
                         });
+                        trace.steps.push(AgentStep::LlmRequest {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            messages_count,
+                            duration_ms: u64::try_from(llm_duration.as_millis())
+                                .unwrap_or(u64::MAX),
+                            success: false,
+                            error: Some(sanitized),
+                            response_preview: None,
+                        });
+                        trace.iterations = iteration + 1;
+                        trace.total_duration_ms =
+                            u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
                         return Err(e);
                     }
                 }
@@ -748,7 +854,10 @@ pub(crate) async fn run_tool_call_loop(
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            trace.iterations = iteration + 1;
+            trace.total_duration_ms =
+                u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            return Ok((display_text, trace));
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
@@ -788,6 +897,13 @@ pub(crate) async fn run_tool_call_loop(
                             "<tool_result name=\"{}\">\n{denied}\n</tool_result>",
                             call.name
                         );
+                        trace.steps.push(AgentStep::ToolCall {
+                            tool: call.name.clone(),
+                            arguments: scrub_credentials_json(&call.arguments),
+                            output_preview: "Denied by user.".to_string(),
+                            duration_ms: 0,
+                            success: false,
+                        });
                         continue;
                     }
                 }
@@ -800,28 +916,57 @@ pub(crate) async fn run_tool_call_loop(
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(call.arguments.clone()).await {
                     Ok(r) => {
+                        let tool_duration = start.elapsed();
+                        let tool_success = r.success;
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
-                            duration: start.elapsed(),
+                            duration: tool_duration,
                             success: r.success,
                         });
-                        if r.success {
+                        let output = if r.success {
                             scrub_credentials(&r.output)
                         } else {
                             format!("Error: {}", r.error.unwrap_or_else(|| r.output))
-                        }
+                        };
+                        trace.steps.push(AgentStep::ToolCall {
+                            tool: call.name.clone(),
+                            arguments: scrub_credentials_json(&call.arguments),
+                            output_preview: truncate_with_ellipsis(&output, OUTPUT_PREVIEW_LIMIT),
+                            duration_ms: u64::try_from(tool_duration.as_millis())
+                                .unwrap_or(u64::MAX),
+                            success: tool_success,
+                        });
+                        output
                     }
                     Err(e) => {
+                        let tool_duration = start.elapsed();
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
-                            duration: start.elapsed(),
+                            duration: tool_duration,
                             success: false,
                         });
-                        format!("Error executing {}: {e}", call.name)
+                        let output = format!("Error executing {}: {e}", call.name);
+                        trace.steps.push(AgentStep::ToolCall {
+                            tool: call.name.clone(),
+                            arguments: scrub_credentials_json(&call.arguments),
+                            output_preview: truncate_with_ellipsis(&output, OUTPUT_PREVIEW_LIMIT),
+                            duration_ms: u64::try_from(tool_duration.as_millis())
+                                .unwrap_or(u64::MAX),
+                            success: false,
+                        });
+                        output
                     }
                 }
             } else {
-                format!("Unknown tool: {}", call.name)
+                let output = format!("Unknown tool: {}", call.name);
+                trace.steps.push(AgentStep::ToolCall {
+                    tool: call.name.clone(),
+                    arguments: scrub_credentials_json(&call.arguments),
+                    output_preview: output.clone(),
+                    duration_ms: 0,
+                    success: false,
+                });
+                output
             };
 
             individual_results.push(result.clone());
@@ -850,6 +995,8 @@ pub(crate) async fn run_tool_call_loop(
         }
     }
 
+    trace.iterations = MAX_TOOL_ITERATIONS;
+    trace.total_duration_ms = u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
 }
 
@@ -1010,6 +1157,10 @@ pub async fn run(
             "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
         ),
         (
+            "calculator",
+            "Evaluate math expressions inside the agent process (no shell). Use when: arithmetic, formula checks, and deterministic numeric reasoning.",
+        ),
+        (
             "memory_store",
             "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
         ),
@@ -1153,7 +1304,7 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let response = run_tool_call_loop(
+        let (response, _trace) = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
             &tools_registry,
@@ -1290,7 +1441,7 @@ pub async fn run(
             )
             .await
             {
-                Ok(resp) => resp,
+                Ok((resp, _trace)) => resp,
                 Err(e) => {
                     eprintln!("\nError: {e}\n");
                     continue;
@@ -1416,6 +1567,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
         ("file_write", "Write file contents."),
+        ("calculator", "Evaluate math expressions in-process."),
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),

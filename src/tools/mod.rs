@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod browser_open;
+pub mod calculator;
 pub mod composio;
 pub mod cron_add;
 pub mod cron_list;
@@ -8,6 +9,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod email_send;
 pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
@@ -25,9 +27,11 @@ pub mod schema;
 pub mod screenshot;
 pub mod shell;
 pub mod traits;
+pub mod web_search;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use calculator::CalculatorTool;
 pub use composio::ComposioTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
@@ -36,6 +40,7 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use email_send::EmailSendTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
@@ -56,6 +61,7 @@ pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use web_search::WebSearchTool;
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
@@ -77,7 +83,8 @@ pub fn default_tools_with_runtime(
     vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
         Box::new(FileReadTool::new(security.clone())),
-        Box::new(FileWriteTool::new(security)),
+        Box::new(FileWriteTool::new(security.clone())),
+        Box::new(CalculatorTool::new(security)),
     ]
 }
 
@@ -132,6 +139,7 @@ pub fn all_tools_with_runtime(
         Box::new(ShellTool::new(security.clone(), runtime)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
+        Box::new(CalculatorTool::new(security.clone())),
         Box::new(CronAddTool::new(config.clone(), security.clone())),
         Box::new(CronListTool::new(config.clone())),
         Box::new(CronRemoveTool::new(config.clone())),
@@ -188,6 +196,25 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    if root_config.email_tool.enabled {
+        tools.push(Box::new(EmailSendTool::new(
+            security.clone(),
+            root_config.email_tool.clone(),
+        )));
+    }
+
+    if root_config.web_search.enabled {
+        if let Some(api_key) =
+            WebSearchTool::resolve_api_key(root_config.web_search.api_key.as_deref())
+        {
+            tools.push(Box::new(WebSearchTool::new(
+                api_key,
+                root_config.web_search.max_results,
+                root_config.web_search.timeout_secs,
+            )));
+        }
+    }
+
     // Vision tools are always available
     tools.push(Box::new(ScreenshotTool::new(security.clone())));
     tools.push(Box::new(ImageInfoTool::new(security.clone())));
@@ -232,10 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn default_tools_has_three() {
+    fn default_tools_has_four() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
     }
 
     #[test]
@@ -275,6 +302,7 @@ mod tests {
         assert!(!names.contains(&"browser_open"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"pushover"));
+        assert!(names.contains(&"calculator"));
     }
 
     #[test]
@@ -313,6 +341,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"pushover"));
+        assert!(names.contains(&"calculator"));
     }
 
     #[test]
@@ -323,6 +352,7 @@ mod tests {
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"file_write"));
+        assert!(names.contains(&"calculator"));
     }
 
     #[test]
