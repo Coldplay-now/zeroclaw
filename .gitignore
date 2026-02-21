@@ -30,3 +30,5 @@ venv/
 credentials.json
 .worktrees/
 learn-zeroclaw/workspace/daemon_state.json
+learn-zeroclaw/workspace/.run/
+learn-zeroclaw/workspace/workspace/
