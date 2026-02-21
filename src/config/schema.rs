@@ -163,6 +163,10 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// Email send tool configuration (`[email_tool]`).
+    #[serde(default)]
+    pub email_tool: EmailToolConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -1015,6 +1019,59 @@ pub struct WebSearchConfig {
 
 fn default_web_search_provider() -> String {
     "duckduckgo".into()
+}
+
+/// Email send tool configuration (`[email_tool]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EmailToolConfig {
+    /// Enable the email_send tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// SMTP server hostname (e.g. "smtp.feishu.cn", "smtp.gmail.com").
+    #[serde(default)]
+    pub smtp_host: String,
+    /// SMTP server port (587 = STARTTLS, 465 = implicit TLS).
+    #[serde(default = "default_email_tool_smtp_port")]
+    pub smtp_port: u16,
+    /// Enable TLS (true for 587/465; false for plaintext LAN only).
+    #[serde(default = "default_email_tool_smtp_tls")]
+    pub smtp_tls: bool,
+    /// SMTP authentication username (usually the sender email address).
+    #[serde(default)]
+    pub username: String,
+    /// SMTP authentication password. Falls back to EMAIL_TOOL_PASSWORD env var if empty.
+    #[serde(default)]
+    pub password: String,
+    /// From address shown to recipients (e.g. "Bot <bot@example.com>").
+    #[serde(default)]
+    pub from_address: String,
+    /// Allowed recipient addresses or domain patterns (e.g. ["*"] or ["@example.com"]).
+    /// Empty list = deny all.
+    #[serde(default)]
+    pub allowed_recipients: Vec<String>,
+}
+
+fn default_email_tool_smtp_port() -> u16 {
+    587
+}
+
+fn default_email_tool_smtp_tls() -> bool {
+    true
+}
+
+impl Default for EmailToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smtp_host: String::new(),
+            smtp_port: default_email_tool_smtp_port(),
+            smtp_tls: default_email_tool_smtp_tls(),
+            username: String::new(),
+            password: String::new(),
+            from_address: String::new(),
+            allowed_recipients: vec![],
+        }
+    }
 }
 
 fn default_web_search_max_results() -> usize {
@@ -2892,6 +2949,7 @@ impl Default for Config {
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            email_tool: EmailToolConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -4091,6 +4149,7 @@ default_temperature = 0.7
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            email_tool: EmailToolConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -4266,6 +4325,7 @@ trajectory_tool_call_dedup_window = 7
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            email_tool: EmailToolConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),

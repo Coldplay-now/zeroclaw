@@ -17,6 +17,7 @@
 
 pub mod browser;
 pub mod browser_open;
+pub mod email_send;
 pub mod composio;
 pub mod cron_add;
 pub mod cron_list;
@@ -57,6 +58,7 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use email_send::EmailSendTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
@@ -258,6 +260,14 @@ pub fn all_tools_with_runtime(
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
+        )));
+    }
+
+    // Email send tool
+    if root_config.email_tool.enabled {
+        tool_arcs.push(Arc::new(EmailSendTool::new(
+            security.clone(),
+            root_config.email_tool.clone(),
         )));
     }
 
