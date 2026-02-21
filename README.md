@@ -52,6 +52,28 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
 
+## Fork Notice (Coldplay-now/zeroclaw)
+
+This repository tracks upstream `zeroclaw-labs/zeroclaw`, but it is **not a plain mirror**.
+It includes fork-specific workflow, local ops scripts, dashboard learning materials, and tool customizations.
+
+- Upstream base: `https://github.com/zeroclaw-labs/zeroclaw`
+- Fork sync strategy (used in this repo): `learn-zeroclaw/12-fork-upstream-sync-strategy.md`
+
+### What is different in this fork
+
+- `learn-zeroclaw/` adds a complete local learning and operations workspace.
+- `learn-zeroclaw/local-services.sh` and `learn-zeroclaw/diagnose-local.sh` provide non-Docker local service management and diagnostics.
+- `learn-zeroclaw/web-ui/` contains a fork-specific dashboard implementation and UX iteration records.
+- Fork-level runtime/tool changes include local web search wiring, calculator/email-send related adjustments, and workspace-oriented docs/config.
+
+### Recommended entry points for this fork
+
+- Project overview: `learn-zeroclaw/01-project-overview.md`
+- Local services and pair code: `learn-zeroclaw/10-local-services-and-paircode-guide.md`
+- Skill vs Tool guide: `learn-zeroclaw/11-skills-vs-tools-guide.md`
+- Fork/upstream sync playbook: `learn-zeroclaw/12-fork-upstream-sync-strategy.md`
+
 ### 📢 Announcements
 
 Use this board for important notices (breaking changes, security advisories, maintenance windows, and release blockers).
