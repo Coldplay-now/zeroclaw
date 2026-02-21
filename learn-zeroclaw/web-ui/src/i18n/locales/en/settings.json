@@ -31,5 +31,16 @@
   "provider": "Provider",
   "notSet": "Not set",
   "default": "Default",
-  "auto": "Auto"
+  "auto": "Auto",
+  "saveRejected": "Some fields were rejected",
+  "limitsSection": "Limits",
+  "rangeHint": "Range: {{min}} - {{max}}",
+  "agentMaxToolIterations": "Agent Max Tool Iterations",
+  "agentMaxHistoryMessages": "Agent Max History Messages",
+  "channelsMessageTimeoutSecs": "Channel Message Timeout (sec)",
+  "schedulerMaxConcurrent": "Scheduler Max Concurrent",
+  "schedulerMaxTasks": "Scheduler Max Tasks",
+  "reliabilitySchedulerPollSecs": "Scheduler Poll Interval (sec)",
+  "reliabilitySchedulerRetries": "Scheduler Retries",
+  "autonomyMaxActionsPerHour": "Autonomy Max Actions/Hour"
 }

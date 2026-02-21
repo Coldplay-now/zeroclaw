@@ -31,5 +31,16 @@
   "provider": "提供商",
   "notSet": "未设置",
   "default": "默认",
-  "auto": "自动"
+  "auto": "自动",
+  "saveRejected": "部分字段被拒绝",
+  "limitsSection": "限制项",
+  "rangeHint": "范围：{{min}} - {{max}}",
+  "agentMaxToolIterations": "Agent 工具迭代上限",
+  "agentMaxHistoryMessages": "Agent 历史消息上限",
+  "channelsMessageTimeoutSecs": "频道消息超时（秒）",
+  "schedulerMaxConcurrent": "调度最大并发",
+  "schedulerMaxTasks": "调度最大任务数",
+  "reliabilitySchedulerPollSecs": "调度轮询间隔（秒）",
+  "reliabilitySchedulerRetries": "调度重试次数",
+  "autonomyMaxActionsPerHour": "自治每小时最大操作数"
 }

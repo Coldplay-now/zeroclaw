@@ -22,7 +22,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use parking_lot::Mutex;
@@ -574,6 +574,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
+        .route("/config", get(handle_get_config))
+        .route("/config", patch(handle_patch_config))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -609,6 +611,310 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+fn unauthorized_pairing_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+        })),
+    )
+}
+
+fn require_pairing_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if !state.pairing.require_pairing() {
+        return None;
+    }
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    if state.pairing.is_authenticated(token) {
+        None
+    } else {
+        Some(unauthorized_pairing_response())
+    }
+}
+
+fn redacted_api_key(api_key: Option<&str>) -> Option<String> {
+    api_key.map(|key| {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if trimmed.len() <= 8 {
+            return "*".repeat(trimmed.len());
+        }
+        format!("{}***{}", &trimmed[..4], &trimmed[trimmed.len() - 2..])
+    })
+}
+
+/// GET /config — return dashboard-safe config view (no plaintext secrets).
+async fn handle_get_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let cfg = state.config.lock().clone();
+    let body = serde_json::json!({
+        "default_provider": cfg.default_provider,
+        "default_model": cfg.default_model,
+        "default_temperature": cfg.default_temperature,
+        "api_key": redacted_api_key(cfg.api_key.as_deref()),
+        "api_url": cfg.api_url,
+        "autonomy": {
+            "level": cfg.autonomy.level,
+            "workspace_only": cfg.autonomy.workspace_only,
+            "max_actions_per_hour": cfg.autonomy.max_actions_per_hour
+        },
+        "memory": {
+            "backend": cfg.memory.backend,
+            "auto_save": cfg.memory.auto_save
+        },
+        "heartbeat": {
+            "enabled": cfg.heartbeat.enabled,
+            "interval_minutes": cfg.heartbeat.interval_minutes
+        },
+        "cron": {
+            "enabled": cfg.cron.enabled,
+            "max_run_history": cfg.cron.max_run_history
+        },
+        "observability": {
+            "backend": cfg.observability.backend
+        },
+        "gateway": {
+            "port": cfg.gateway.port,
+            "host": cfg.gateway.host,
+            "require_pairing": cfg.gateway.require_pairing
+        },
+        "cost": {
+            "enabled": cfg.cost.enabled,
+            "daily_limit_usd": cfg.cost.daily_limit_usd,
+            "monthly_limit_usd": cfg.cost.monthly_limit_usd,
+            "warn_at_percent": cfg.cost.warn_at_percent
+        },
+        "agent": {
+            "max_tool_iterations": cfg.agent.max_tool_iterations,
+            "max_history_messages": cfg.agent.max_history_messages,
+            "parallel_tools": cfg.agent.parallel_tools
+        },
+        "channels_config": {
+            "message_timeout_secs": cfg.channels_config.message_timeout_secs
+        },
+        "scheduler": {
+            "max_concurrent": cfg.scheduler.max_concurrent,
+            "max_tasks": cfg.scheduler.max_tasks
+        },
+        "reliability": {
+            "scheduler_poll_secs": cfg.reliability.scheduler_poll_secs,
+            "scheduler_retries": cfg.reliability.scheduler_retries
+        }
+    });
+    (StatusCode::OK, Json(body))
+}
+
+/// PATCH /config — hot-update allowlisted fields for dashboard settings.
+async fn handle_patch_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let Some(map) = payload.as_object() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid payload: expected JSON object"
+            })),
+        );
+    };
+
+    let mut updated: Vec<String> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+    let mut cfg = state.config.lock().clone();
+
+    for (key, value) in map {
+        let applied = match key.as_str() {
+            // Existing editable fields in current Settings page.
+            "default_model" => match value {
+                serde_json::Value::String(v) => {
+                    cfg.default_model = if v.trim().is_empty() {
+                        None
+                    } else {
+                        Some(v.trim().to_string())
+                    };
+                    true
+                }
+                serde_json::Value::Null => {
+                    cfg.default_model = None;
+                    true
+                }
+                _ => false,
+            },
+            "default_temperature" => value
+                .as_f64()
+                .filter(|v| v.is_finite() && (0.0..=2.0).contains(v))
+                .map(|v| {
+                    cfg.default_temperature = v;
+                    true
+                })
+                .unwrap_or(false),
+            "autonomy_level" => value
+                .as_str()
+                .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                    "readonly" | "read_only" => Some(crate::security::AutonomyLevel::ReadOnly),
+                    "supervised" => Some(crate::security::AutonomyLevel::Supervised),
+                    "full" => Some(crate::security::AutonomyLevel::Full),
+                    _ => None,
+                })
+                .map(|v| {
+                    cfg.autonomy.level = v;
+                    true
+                })
+                .unwrap_or(false),
+            "memory_auto_save" => value
+                .as_bool()
+                .map(|v| {
+                    cfg.memory.auto_save = v;
+                    true
+                })
+                .unwrap_or(false),
+            "heartbeat_enabled" => value
+                .as_bool()
+                .map(|v| {
+                    cfg.heartbeat.enabled = v;
+                    true
+                })
+                .unwrap_or(false),
+            "heartbeat_interval_minutes" => value
+                .as_u64()
+                .filter(|v| (1..=1440).contains(v))
+                .map(|v| {
+                    cfg.heartbeat.interval_minutes = v as u32;
+                    true
+                })
+                .unwrap_or(false),
+
+            // Phase 1 limits.
+            "agent_max_tool_iterations" => value
+                .as_u64()
+                .filter(|v| (1..=50).contains(v))
+                .map(|v| {
+                    cfg.agent.max_tool_iterations = v as usize;
+                    true
+                })
+                .unwrap_or(false),
+            "agent_max_history_messages" => value
+                .as_u64()
+                .filter(|v| (10..=200).contains(v))
+                .map(|v| {
+                    cfg.agent.max_history_messages = v as usize;
+                    true
+                })
+                .unwrap_or(false),
+            "channels_message_timeout_secs" => value
+                .as_u64()
+                .filter(|v| (30..=1800).contains(v))
+                .map(|v| {
+                    cfg.channels_config.message_timeout_secs = v;
+                    true
+                })
+                .unwrap_or(false),
+            "scheduler_max_concurrent" => value
+                .as_u64()
+                .filter(|v| (1..=32).contains(v))
+                .map(|v| {
+                    cfg.scheduler.max_concurrent = v as usize;
+                    true
+                })
+                .unwrap_or(false),
+            "scheduler_max_tasks" => value
+                .as_u64()
+                .filter(|v| (1..=1000).contains(v))
+                .map(|v| {
+                    cfg.scheduler.max_tasks = v as usize;
+                    true
+                })
+                .unwrap_or(false),
+            "reliability_scheduler_poll_secs" => value
+                .as_u64()
+                .filter(|v| (5..=300).contains(v))
+                .map(|v| {
+                    cfg.reliability.scheduler_poll_secs = v;
+                    true
+                })
+                .unwrap_or(false),
+            "reliability_scheduler_retries" => value
+                .as_u64()
+                .filter(|v| *v <= 10)
+                .map(|v| {
+                    cfg.reliability.scheduler_retries = v as u32;
+                    true
+                })
+                .unwrap_or(false),
+            "autonomy_max_actions_per_hour" => value
+                .as_u64()
+                .filter(|v| (1..=1000).contains(v))
+                .map(|v| {
+                    cfg.autonomy.max_actions_per_hour = v as u32;
+                    true
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+
+        if applied {
+            updated.push(key.clone());
+        } else {
+            rejected.push(key.clone());
+        }
+    }
+
+    if cfg.validate().is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "updated": [],
+                "rejected": rejected,
+                "rejected_reason": "config validation failed after patch"
+            })),
+        );
+    }
+
+    if let Err(err) = cfg.save().await {
+        tracing::error!("Failed to persist config patch: {err:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "updated": [],
+                "rejected": rejected,
+                "rejected_reason": "failed to persist config.toml"
+            })),
+        );
+    }
+
+    // Replace in-memory snapshot used by gateway handlers.
+    *state.config.lock() = cfg;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "updated": updated,
+            "rejected": rejected,
+            "rejected_reason": serde_json::Value::Null
+        })),
+    )
 }
 
 /// Prometheus content type for text exposition format.

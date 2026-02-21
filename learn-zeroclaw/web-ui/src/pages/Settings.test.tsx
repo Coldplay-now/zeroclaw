@@ -29,6 +29,9 @@ const mockConfig = {
   gateway: { port: 3000, host: "127.0.0.1", require_pairing: true },
   cost: { enabled: true, daily_limit_usd: 10, monthly_limit_usd: 100, warn_at_percent: 80 },
   agent: { max_tool_iterations: 10, max_history_messages: 50, parallel_tools: true },
+  channels_config: { message_timeout_secs: 300 },
+  scheduler: { max_concurrent: 4, max_tasks: 64 },
+  reliability: { scheduler_poll_secs: 15, scheduler_retries: 2 },
 };
 
 function renderWithProviders(ui: React.ReactElement) {

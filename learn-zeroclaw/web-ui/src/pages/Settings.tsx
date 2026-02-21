@@ -97,6 +97,14 @@ export function Settings() {
         </div>
       </div>
 
+      {saveResult && saveResult.rejected.length > 0 && (
+        <Card>
+          <CardContent className="p-4 text-sm text-amber-700">
+            {t("saveRejected")}: {saveResult.rejected.join(", ")}
+          </CardContent>
+        </Card>
+      )}
+
       {/* Editable: Model */}
       <Card>
         <CardHeader className="pb-2">
@@ -211,6 +219,148 @@ export function Settings() {
         </CardContent>
       </Card>
 
+      {/* Editable: Limits (Phase 1) */}
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm flex items-center gap-2">
+            {t("limitsSection")}
+            <span className="text-[10px] bg-muted px-1.5 py-0.5 rounded font-normal">
+              {t("requiresRestart")}
+            </span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <SettingField
+            label={t("agentMaxToolIterations")}
+            value={
+              draft.agent_max_tool_iterations !== undefined
+                ? String(draft.agent_max_tool_iterations)
+                : String(config.agent.max_tool_iterations)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                agent_max_tool_iterations: parseInt(v, 10) || 10,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 1, max: 50 })}
+          />
+          <SettingField
+            label={t("agentMaxHistoryMessages")}
+            value={
+              draft.agent_max_history_messages !== undefined
+                ? String(draft.agent_max_history_messages)
+                : String(config.agent.max_history_messages)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                agent_max_history_messages: parseInt(v, 10) || 50,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 10, max: 200 })}
+          />
+          <SettingField
+            label={t("channelsMessageTimeoutSecs")}
+            value={
+              draft.channels_message_timeout_secs !== undefined
+                ? String(draft.channels_message_timeout_secs)
+                : String(config.channels_config.message_timeout_secs)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                channels_message_timeout_secs: parseInt(v, 10) || 300,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 30, max: 1800 })}
+          />
+          <SettingField
+            label={t("schedulerMaxConcurrent")}
+            value={
+              draft.scheduler_max_concurrent !== undefined
+                ? String(draft.scheduler_max_concurrent)
+                : String(config.scheduler.max_concurrent)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                scheduler_max_concurrent: parseInt(v, 10) || 4,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 1, max: 32 })}
+          />
+          <SettingField
+            label={t("schedulerMaxTasks")}
+            value={
+              draft.scheduler_max_tasks !== undefined
+                ? String(draft.scheduler_max_tasks)
+                : String(config.scheduler.max_tasks)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                scheduler_max_tasks: parseInt(v, 10) || 64,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 1, max: 1000 })}
+          />
+          <SettingField
+            label={t("reliabilitySchedulerPollSecs")}
+            value={
+              draft.reliability_scheduler_poll_secs !== undefined
+                ? String(draft.reliability_scheduler_poll_secs)
+                : String(config.reliability.scheduler_poll_secs)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                reliability_scheduler_poll_secs: parseInt(v, 10) || 15,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 5, max: 300 })}
+          />
+          <SettingField
+            label={t("reliabilitySchedulerRetries")}
+            value={
+              draft.reliability_scheduler_retries !== undefined
+                ? String(draft.reliability_scheduler_retries)
+                : String(config.reliability.scheduler_retries)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                reliability_scheduler_retries: parseInt(v, 10) || 2,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 0, max: 10 })}
+          />
+          <SettingField
+            label={t("autonomyMaxActionsPerHour")}
+            value={
+              draft.autonomy_max_actions_per_hour !== undefined
+                ? String(draft.autonomy_max_actions_per_hour)
+                : String(config.autonomy.max_actions_per_hour)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                autonomy_max_actions_per_hour: parseInt(v, 10) || 20,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 1, max: 1000 })}
+          />
+        </CardContent>
+      </Card>
+
       {/* Read-only: Gateway */}
       <Card>
         <CardHeader className="pb-2">
@@ -285,15 +435,20 @@ function SettingField({
   value,
   onChange,
   type = "text",
+  hint,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   type?: string;
+  hint?: string;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4">
-      <label className="text-sm text-muted-foreground shrink-0">{label}</label>
+    <div className="flex items-start justify-between gap-4">
+      <div className="shrink-0">
+        <label className="text-sm text-muted-foreground">{label}</label>
+        {hint && <p className="text-[11px] text-muted-foreground mt-0.5">{hint}</p>}
+      </div>
       <input
         type={type}
         value={value}

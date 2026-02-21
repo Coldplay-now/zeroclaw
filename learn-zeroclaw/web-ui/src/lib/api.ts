@@ -509,6 +509,9 @@ export interface ConfigResponse {
   gateway: { port: number; host: string; require_pairing: boolean };
   cost: { enabled: boolean; daily_limit_usd: number; monthly_limit_usd: number; warn_at_percent: number };
   agent: { max_tool_iterations: number; max_history_messages: number; parallel_tools: boolean };
+  channels_config: { message_timeout_secs: number };
+  scheduler: { max_concurrent: number; max_tasks: number };
+  reliability: { scheduler_poll_secs: number; scheduler_retries: number };
 }
 
 export interface ConfigPatchResponse {
