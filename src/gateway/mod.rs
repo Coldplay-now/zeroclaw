@@ -7,18 +7,14 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
-use crate::channels::{Channel, SendMessage, WhatsAppChannel};
+use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
-use crate::cron;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::observability::{self, Observer};
-use crate::providers::{self, ChatMessage, Provider};
+use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::skills;
-use crate::tools::{self, Tool};
+use crate::tools;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -31,7 +27,6 @@ use axum::{
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::fmt::Write as FmtWrite;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,9 +36,8 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout — prevents slow-loris attacks.
-/// Set to 120s to accommodate the full agent tool-call loop.
-pub const REQUEST_TIMEOUT_SECS: u64 = 120;
+/// Request timeout (30s) — prevents slow-loris attacks
+pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -59,19 +53,12 @@ fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String 
     format!("whatsapp_{}_{}", msg.sender, msg.id)
 }
 
-/// Build context by recalling relevant memory entries for the user message.
-async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
-    let mut context = String::new();
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
-        if !entries.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &entries {
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
-            }
-            context.push('\n');
-        }
-    }
-    context
+fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("linq_{}_{}", msg.sender, msg.id)
+}
+
+fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -295,12 +282,14 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
-    /// Tool registry for full agent loop in webhook
-    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
-    /// Observer for recording agent events
-    pub observer: Arc<dyn Observer>,
-    /// Pre-built system prompt (workspace identity + tool instructions)
-    pub system_prompt: Arc<String>,
+    pub linq: Option<Arc<LinqChannel>>,
+    /// Linq webhook signing secret for signature verification
+    pub linq_signing_secret: Option<Arc<str>>,
+    pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+    /// Nextcloud Talk webhook secret for signature verification
+    pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    /// Observability backend for metrics scraping
+    pub observer: Arc<dyn crate::observability::Observer>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -322,19 +311,26 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
+        &providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            secrets_encrypt: config.secrets.encrypt,
+            reasoning_enabled: config.runtime.reasoning_enabled,
+        },
     )?);
     let model = config
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
+        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
@@ -354,7 +350,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -368,45 +364,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     ));
-
-    // ── Observer for agent loop events ──
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
-
-    // ── System prompt from workspace identity files + tool instructions ──
-    let skills = crate::skills::load_skills(&config.workspace_dir);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
-        ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
-        ("memory_store", "Save to memory."),
-        ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-    ];
-    if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved URLs in browser."));
-    }
-    if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
-    }
-    if !config.agents.is_empty() {
-        tool_descs.push(("delegate", "Delegate a sub-task to a specialized agent."));
-    }
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
-    let mut system_prompt = crate::channels::build_system_prompt(
-        &config.workspace_dir,
-        &model,
-        &tool_descs,
-        &skills,
-        Some(&config.identity),
-        bootstrap_max_chars,
-    );
-    system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
-
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -418,12 +375,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         });
 
     // WhatsApp channel (if configured)
-    let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
-        config.channels_config.whatsapp.as_ref().map(|wa| {
+    let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
+        .channels_config
+        .whatsapp
+        .as_ref()
+        .filter(|wa| wa.is_cloud_config())
+        .map(|wa| {
             Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone(),
-                wa.phone_number_id.clone(),
-                wa.verify_token.clone(),
+                wa.access_token.clone().unwrap_or_default(),
+                wa.phone_number_id.clone().unwrap_or_default(),
+                wa.verify_token.clone().unwrap_or_default(),
                 wa.allowed_numbers.clone(),
             ))
         });
@@ -446,6 +407,68 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             })
         })
         .map(Arc::from);
+
+    // Linq channel (if configured)
+    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
+        Arc::new(LinqChannel::new(
+            lq.api_token.clone(),
+            lq.from_phone.clone(),
+            lq.allowed_senders.clone(),
+        ))
+    });
+
+    // Linq signing secret for webhook signature verification
+    // Priority: environment variable > config file
+    let linq_signing_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINQ_SIGNING_SECRET")
+        .ok()
+        .and_then(|secret| {
+            let secret = secret.trim();
+            (!secret.is_empty()).then(|| secret.to_owned())
+        })
+        .or_else(|| {
+            config.channels_config.linq.as_ref().and_then(|lq| {
+                lq.signing_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|secret| !secret.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .map(Arc::from);
+
+    // Nextcloud Talk channel (if configured)
+    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
+        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
+            Arc::new(NextcloudTalkChannel::new(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nc.allowed_users.clone(),
+            ))
+        });
+
+    // Nextcloud Talk webhook secret for signature verification
+    // Priority: environment variable > config file
+    let nextcloud_talk_webhook_secret: Option<Arc<str>> =
+        std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
+            .ok()
+            .and_then(|secret| {
+                let secret = secret.trim();
+                (!secret.is_empty()).then(|| secret.to_owned())
+            })
+            .or_else(|| {
+                config
+                    .channels_config
+                    .nextcloud_talk
+                    .as_ref()
+                    .and_then(|nc| {
+                        nc.webhook_secret
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|secret| !secret.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
+            })
+            .map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
@@ -498,7 +521,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
+    if linq_channel.is_some() {
+        println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
+    }
+    if nextcloud_talk_channel.is_some() {
+        println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
+    }
     println!("  GET  /health    — health check");
+    println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");
@@ -516,6 +546,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     crate::health::mark_component_ok("gateway");
 
     // Build shared state
+    let observer: Arc<dyn crate::observability::Observer> =
+        Arc::from(crate::observability::create_observer(&config.observability));
+
     let state = AppState {
         config: config_state,
         provider,
@@ -530,57 +563,23 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
-        tools_registry,
+        linq: linq_channel,
+        linq_signing_secret,
+        nextcloud_talk: nextcloud_talk_channel,
+        nextcloud_talk_webhook_secret,
         observer,
-        system_prompt: Arc::new(system_prompt),
     };
 
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
-        // Management API (bearer token required)
-        .route("/status", get(handle_status))
-        .route("/prompts", get(handle_prompts_list))
-        .route("/prompts/preview", get(handle_prompts_preview))
-        .route(
-            "/prompts/{filename}",
-            get(handle_prompts_get).put(handle_prompts_put),
-        )
-        // Memory API (bearer token required)
-        .route("/memory", get(handle_memory_list).post(handle_memory_store))
-        .route("/memory/stats", get(handle_memory_stats))
-        .route("/memory/search", get(handle_memory_search))
-        .route(
-            "/memory/{key}",
-            get(handle_memory_get).delete(handle_memory_delete),
-        )
-        // Tools API (bearer token required)
-        .route("/tools", get(handle_tools_list))
-        .route("/tools/{name}", get(handle_tools_get))
-        // Cron API (bearer token required)
-        .route("/cron/jobs", get(handle_cron_list).post(handle_cron_create))
-        .route(
-            "/cron/jobs/{id}",
-            get(handle_cron_get)
-                .patch(handle_cron_update)
-                .delete(handle_cron_delete),
-        )
-        .route("/cron/jobs/{id}/runs", get(handle_cron_runs))
-        // Audit API (bearer token required)
-        .route("/audit/logs", get(handle_audit_logs))
-        // Metrics API (bearer token required)
-        .route("/metrics", get(handle_metrics))
-        // Skills API (bearer token required)
-        .route("/skills", get(handle_skills_list))
-        .route("/skills/{name}", get(handle_skills_get))
-        // Config API (bearer token required)
-        .route("/config", get(handle_config_get).patch(handle_config_patch))
-        // Channels API (bearer token required)
-        .route("/channels", get(handle_channels_list))
+        .route("/linq", post(handle_linq_webhook))
+        .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -612,1355 +611,40 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     Json(body)
 }
 
-/// Verify bearer token from Authorization header.
-/// Returns Ok(()) if auth passes, or an error response tuple if it fails.
-fn verify_bearer_token(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if state.pairing.require_pairing() {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            let err = serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            });
-            return Err((StatusCode::UNAUTHORIZED, Json(err)));
-        }
-    }
-    Ok(())
-}
+/// Prometheus content type for text exposition format.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// GET /status — system status snapshot (bearer token required)
-async fn handle_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let health = crate::health::snapshot();
-    let config = state.config.lock();
-    let version = env!("CARGO_PKG_VERSION");
-
-    let components: serde_json::Value = health
-        .components
-        .iter()
-        .map(|(name, c)| {
-            (
-                name.clone(),
-                serde_json::json!({
-                    "status": c.status,
-                    "last_ok": c.last_ok,
-                    "last_error": c.last_error,
-                    "restart_count": c.restart_count,
-                }),
-            )
-        })
-        .collect::<serde_json::Map<String, serde_json::Value>>()
-        .into();
-
-    let ws = &config.workspace_dir;
-    let disk_free_mb = fs_free_mb(ws);
-    let workspace_info = serde_json::json!({
-        "path": ws.display().to_string(),
-        "disk_free_mb": disk_free_mb,
-    });
-
-    let body = serde_json::json!({
-        "version": version,
-        "uptime_seconds": health.uptime_seconds,
-        "pid": health.pid,
-        "provider": config.default_provider.as_deref().unwrap_or("unknown"),
-        "model": state.model,
-        "temperature": state.temperature,
-        "autonomy_level": format!("{:?}", config.autonomy.level).to_lowercase(),
-        "memory_backend": format!("{:?}", config.memory.backend).to_lowercase(),
-        "components": components,
-        "workspace": workspace_info,
-    });
-
-    (StatusCode::OK, Json(body))
-}
-
-/// Best-effort available disk space in MB for the given path.
-/// Uses `std::process::Command` to avoid adding libc as a direct dependency.
-fn fs_free_mb(path: &std::path::Path) -> Option<u64> {
-    // `df -k <path>` outputs available KB on both Linux and macOS
-    let output = std::process::Command::new("df")
-        .arg("-k")
-        .arg(path)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Second line, fourth column = available KB
-    let line = stdout.lines().nth(1)?;
-    let available_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
-    Some(available_kb / 1024)
-}
-
-/// Extract tool names from an assistant history message.
-/// Handles both native tool-call format (JSON) and prompt-based XML tags.
-fn extract_tool_names_from_history(content: &str) -> Vec<String> {
-    let mut names = Vec::new();
-
-    // Native format: JSON with "tool_calls" array containing "function.name"
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
-        if let Some(calls) = parsed.get("tool_calls").and_then(|v| v.as_array()) {
-            for call in calls {
-                if let Some(name) = call
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                {
-                    names.push(name.to_string());
-                }
-            }
-        }
-    }
-
-    // Prompt-based format: <tool_call>{"name": "..."}</tool_call>
-    for cap in content.match_indices("<tool_call>") {
-        let start = cap.0 + "<tool_call>".len();
-        if let Some(end) = content[start..].find("</tool_call>") {
-            let json_str = content[start..start + end].trim();
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(name) = parsed.get("name").and_then(|n| n.as_str()) {
-                    if !names.contains(&name.to_string()) {
-                        names.push(name.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    names
-}
-
-// ── Prompts API ──────────────────────────────────────────────────────────────
-
-/// Allowed workspace prompt filenames (whitelist).
-const PROMPT_FILES: &[&str] = &[
-    "AGENTS.md",
-    "SOUL.md",
-    "TOOLS.md",
-    "IDENTITY.md",
-    "USER.md",
-    "HEARTBEAT.md",
-    "BOOTSTRAP.md",
-    "MEMORY.md",
-];
-
-/// Assembly order matches `src/agent/prompt.rs` IdentitySection::build().
-const PROMPT_ASSEMBLY_ORDER: &[&str] = &[
-    "AGENTS.md",
-    "SOUL.md",
-    "TOOLS.md",
-    "IDENTITY.md",
-    "USER.md",
-    "HEARTBEAT.md",
-    "BOOTSTRAP.md",
-    "MEMORY.md",
-];
-
-/// Role descriptions for each prompt file.
-fn prompt_file_role(filename: &str) -> &'static str {
-    match filename {
-        "AGENTS.md" => "Session bootstrap instructions",
-        "SOUL.md" => "Core personality and values",
-        "TOOLS.md" => "Tool usage guidance",
-        "IDENTITY.md" => "Agent identity definition",
-        "USER.md" => "User profile and preferences",
-        "HEARTBEAT.md" => "Periodic heartbeat tasks",
-        "BOOTSTRAP.md" => "Custom bootstrap instructions",
-        "MEMORY.md" => "Long-term memory (agent-managed)",
-        _ => "Unknown",
-    }
-}
-
-/// GET /prompts — list all prompt files with metadata
-async fn handle_prompts_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    let ws = config.workspace_dir.clone();
-    drop(config);
-
-    let mut files = Vec::new();
-    for &filename in PROMPT_ASSEMBLY_ORDER {
-        let path = ws.join(filename);
-        let (exists, chars, bytes, updated) = match std::fs::metadata(&path) {
-            Ok(meta) => {
-                let bytes = meta.len();
-                let chars = std::fs::read_to_string(&path)
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0);
-                let updated = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs());
-                (true, chars, bytes, updated)
-            }
-            Err(_) => (false, 0, 0, None),
-        };
-
-        files.push(serde_json::json!({
-            "filename": filename,
-            "exists": exists,
-            "role": prompt_file_role(filename),
-            "chars": chars,
-            "bytes": bytes,
-            "updated_epoch": updated,
-        }));
-    }
-
-    let total_chars: u64 = files.iter().filter_map(|f| f["chars"].as_u64()).sum();
-
-    let body = serde_json::json!({
-        "files": files,
-        "total_chars": total_chars,
-        "max_chars_per_file": 20_000,
-    });
-
-    (StatusCode::OK, Json(body))
-}
-
-/// GET /prompts/:filename — return a single file's full content
-async fn handle_prompts_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(filename): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    if !PROMPT_FILES.contains(&filename.as_str()) {
-        let err = serde_json::json!({
-            "error": format!("File not allowed: {filename}"),
-            "allowed": PROMPT_FILES,
-        });
-        return (StatusCode::FORBIDDEN, Json(err));
-    }
-
-    let config = state.config.lock();
-    let path = config.workspace_dir.join(&filename);
-    drop(config);
-
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let body = serde_json::json!({
-                "filename": filename,
-                "content": content,
-                "chars": content.chars().count(),
-            });
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let body = serde_json::json!({
-                "filename": filename,
-                "content": null,
-                "chars": 0,
-                "exists": false,
-            });
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to read {filename}: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-/// Request body for PUT /prompts/:filename
-#[derive(serde::Deserialize)]
-struct PromptsUpdateBody {
-    content: String,
-}
-
-/// PUT /prompts/:filename — overwrite a prompt file
-async fn handle_prompts_put(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(filename): axum::extract::Path<String>,
-    body: Result<Json<PromptsUpdateBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    if !PROMPT_FILES.contains(&filename.as_str()) {
-        let err = serde_json::json!({
-            "error": format!("File not allowed: {filename}"),
-            "allowed": PROMPT_FILES,
-        });
-        return (StatusCode::FORBIDDEN, Json(err));
-    }
-
-    let Json(update) = match body {
-        Ok(b) => b,
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Invalid JSON body: {e}. Expected: {{\"content\": \"...\"}}")});
-            return (StatusCode::BAD_REQUEST, Json(err));
-        }
-    };
-
-    // UTF-8 validation is implicit (Rust strings are always valid UTF-8).
-    // Check character limit.
-    let char_count = update.content.chars().count();
-    if char_count > 20_000 {
-        let err = serde_json::json!({
-            "error": format!("Content exceeds 20,000 character limit ({char_count} chars)"),
-            "chars": char_count,
-            "max_chars": 20_000,
-        });
-        return (StatusCode::BAD_REQUEST, Json(err));
-    }
-
-    let config = state.config.lock();
-    let path = config.workspace_dir.join(&filename);
-    drop(config);
-
-    match std::fs::write(&path, &update.content) {
-        Ok(()) => {
-            tracing::info!("Prompt file updated via API: {filename} ({char_count} chars)");
-            let body = serde_json::json!({
-                "filename": filename,
-                "chars": char_count,
-                "saved": true,
-            });
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to write {filename}: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-/// GET /prompts/preview — assemble all prompt files in order, return merged text
-async fn handle_prompts_preview(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    let ws = config.workspace_dir.clone();
-    drop(config);
-
-    let mut assembled = String::new();
-    for &filename in PROMPT_ASSEMBLY_ORDER {
-        let path = ws.join(filename);
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if !assembled.is_empty() {
-                assembled.push_str("\n\n");
-            }
-            let _ = writeln!(assembled, "--- {filename} ---");
-            // Truncate to match agent behavior (20,000 chars per file)
-            if content.chars().count() > 20_000 {
-                let truncated: String = content.chars().take(20_000).collect();
-                assembled.push_str(&truncated);
-                assembled.push_str("\n[... truncated at 20,000 chars]");
-            } else {
-                assembled.push_str(&content);
-            }
-        }
-    }
-
-    let body = serde_json::json!({
-        "preview": assembled,
-        "chars": assembled.chars().count(),
-    });
-
-    (StatusCode::OK, Json(body))
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// MEMORY API HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
-
-#[derive(serde::Deserialize)]
-struct MemoryListQuery {
-    category: Option<String>,
-    session_id: Option<String>,
-}
-
-/// GET /memory — list memory entries
-async fn handle_memory_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<MemoryListQuery>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let category = query.category.as_deref().map(|c| match c {
-        "core" => MemoryCategory::Core,
-        "daily" => MemoryCategory::Daily,
-        "conversation" => MemoryCategory::Conversation,
-        other => MemoryCategory::Custom(other.to_string()),
-    });
-
-    match state
-        .mem
-        .list(category.as_ref(), query.session_id.as_deref())
-        .await
+/// GET /metrics — Prometheus text exposition format
+async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = if let Some(prom) = state
+        .observer
+        .as_ref()
+        .as_any()
+        .downcast_ref::<crate::observability::PrometheusObserver>()
     {
-        Ok(entries) => {
-            let count = entries.len();
-            let body = serde_json::json!({
-                "entries": entries,
-                "count": count,
-            });
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to list memory: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct MemoryStoreBody {
-    key: String,
-    content: String,
-    category: Option<String>,
-    session_id: Option<String>,
-}
-
-/// POST /memory — store a memory entry
-async fn handle_memory_store(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<MemoryStoreBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let Json(data) = match body {
-        Ok(b) => b,
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Invalid JSON: {e}")});
-            return (StatusCode::BAD_REQUEST, Json(err));
-        }
+        prom.encode()
+    } else {
+        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
     };
 
-    let category = match data.category.as_deref() {
-        Some("core") => MemoryCategory::Core,
-        Some("daily") => MemoryCategory::Daily,
-        Some("conversation") => MemoryCategory::Conversation,
-        Some(other) => MemoryCategory::Custom(other.to_string()),
-        None => MemoryCategory::Custom("api".to_string()),
-    };
-
-    match state
-        .mem
-        .store(
-            &data.key,
-            &data.content,
-            category,
-            data.session_id.as_deref(),
-        )
-        .await
-    {
-        Ok(()) => {
-            let body = serde_json::json!({"stored": true, "key": data.key});
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to store memory: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-/// GET /memory/stats — memory backend stats
-async fn handle_memory_stats(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let count = state.mem.count().await.unwrap_or(0);
-    let healthy = state.mem.health_check().await;
-
-    let body = serde_json::json!({
-        "backend": state.mem.name(),
-        "count": count,
-        "healthy": healthy,
-    });
-
-    (StatusCode::OK, Json(body))
-}
-
-#[derive(serde::Deserialize)]
-struct MemorySearchQuery {
-    q: String,
-    limit: Option<usize>,
-    session_id: Option<String>,
-}
-
-/// GET /memory/search — recall/search memory entries
-async fn handle_memory_search(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<MemorySearchQuery>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let limit = query.limit.unwrap_or(10).min(50);
-
-    match state
-        .mem
-        .recall(&query.q, limit, query.session_id.as_deref())
-        .await
-    {
-        Ok(entries) => {
-            let count = entries.len();
-            let body = serde_json::json!({
-                "entries": entries,
-                "count": count,
-                "query": query.q,
-            });
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Memory search failed: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-/// GET /memory/{key} — get a single memory entry
-async fn handle_memory_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(key): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    match state.mem.get(&key).await {
-        Ok(Some(entry)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(entry).unwrap_or_default()),
-        ),
-        Ok(None) => {
-            let err = serde_json::json!({"error": format!("Memory key not found: {key}")});
-            (StatusCode::NOT_FOUND, Json(err))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to get memory: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-/// DELETE /memory/{key} — forget a memory entry
-async fn handle_memory_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(key): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    match state.mem.forget(&key).await {
-        Ok(true) => {
-            let body = serde_json::json!({"deleted": true, "key": key});
-            (StatusCode::OK, Json(body))
-        }
-        Ok(false) => {
-            let err = serde_json::json!({"error": format!("Memory key not found: {key}")});
-            (StatusCode::NOT_FOUND, Json(err))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to delete memory: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// TOOLS API HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// GET /tools — list all registered tools
-async fn handle_tools_list(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let tools: Vec<serde_json::Value> = state
-        .tools_registry
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "name": t.name(),
-                "description": t.description(),
-            })
-        })
-        .collect();
-
-    let count = tools.len();
-    let body = serde_json::json!({
-        "tools": tools,
-        "count": count,
-    });
-
-    (StatusCode::OK, Json(body))
-}
-
-/// GET /tools/{name} — get a single tool's full spec
-async fn handle_tools_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    match state.tools_registry.iter().find(|t| t.name() == name) {
-        Some(tool) => {
-            let spec = tool.spec();
-            let body = serde_json::json!({
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.parameters,
-            });
-            (StatusCode::OK, Json(body))
-        }
-        None => {
-            let err = serde_json::json!({"error": format!("Tool not found: {name}")});
-            (StatusCode::NOT_FOUND, Json(err))
-        }
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// CRON API HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// GET /cron/jobs — list all cron jobs
-async fn handle_cron_list(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    let result = cron::list_jobs(&config);
-    drop(config);
-
-    match result {
-        Ok(jobs) => {
-            let count = jobs.len();
-            let body = serde_json::json!({
-                "jobs": jobs,
-                "count": count,
-            });
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to list cron jobs: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct CronCreateBody {
-    schedule: cron::Schedule,
-    #[serde(default)]
-    job_type: cron::JobType,
-    command: Option<String>,
-    prompt: Option<String>,
-    name: Option<String>,
-    #[serde(default)]
-    session_target: cron::SessionTarget,
-    model: Option<String>,
-    delivery: Option<cron::DeliveryConfig>,
-    #[serde(default)]
-    delete_after_run: bool,
-}
-
-/// POST /cron/jobs — create a new cron job
-async fn handle_cron_create(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<CronCreateBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let Json(data) = match body {
-        Ok(b) => b,
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Invalid JSON: {e}")});
-            return (StatusCode::BAD_REQUEST, Json(err));
-        }
-    };
-
-    let config = state.config.lock();
-    let result = match data.job_type {
-        cron::JobType::Shell => {
-            let Some(ref cmd) = data.command else {
-                drop(config);
-                let err = serde_json::json!({"error": "Shell job requires 'command' field"});
-                return (StatusCode::BAD_REQUEST, Json(err));
-            };
-            cron::add_shell_job(&config, data.name.clone(), data.schedule.clone(), cmd)
-        }
-        cron::JobType::Agent => {
-            let Some(ref prompt) = data.prompt else {
-                drop(config);
-                let err = serde_json::json!({"error": "Agent job requires 'prompt' field"});
-                return (StatusCode::BAD_REQUEST, Json(err));
-            };
-            cron::add_agent_job(
-                &config,
-                data.name.clone(),
-                data.schedule.clone(),
-                prompt,
-                data.session_target.clone(),
-                data.model.clone(),
-                data.delivery.clone(),
-                data.delete_after_run,
-            )
-        }
-    };
-    drop(config);
-
-    match result {
-        Ok(job) => (
-            StatusCode::CREATED,
-            Json(serde_json::to_value(job).unwrap_or_default()),
-        ),
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to create cron job: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-/// GET /cron/jobs/{id} — get a single cron job
-async fn handle_cron_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    let result = cron::get_job(&config, &id);
-    drop(config);
-
-    match result {
-        Ok(job) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(job).unwrap_or_default()),
-        ),
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Cron job not found: {e}")});
-            (StatusCode::NOT_FOUND, Json(err))
-        }
-    }
-}
-
-/// PATCH /cron/jobs/{id} — update a cron job
-async fn handle_cron_update(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    body: Result<Json<cron::CronJobPatch>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let Json(patch) = match body {
-        Ok(b) => b,
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Invalid JSON: {e}")});
-            return (StatusCode::BAD_REQUEST, Json(err));
-        }
-    };
-
-    let config = state.config.lock();
-    let result = cron::update_job(&config, &id, patch);
-    drop(config);
-
-    match result {
-        Ok(job) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(job).unwrap_or_default()),
-        ),
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to update cron job: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-/// DELETE /cron/jobs/{id} — delete a cron job
-async fn handle_cron_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    let result = cron::remove_job(&config, &id);
-    drop(config);
-
-    match result {
-        Ok(()) => {
-            let body = serde_json::json!({"deleted": true, "id": id});
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to delete cron job: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct CronRunsQuery {
-    limit: Option<usize>,
-}
-
-/// GET /cron/jobs/{id}/runs — list recent runs for a cron job
-async fn handle_cron_runs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Query(query): Query<CronRunsQuery>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let limit = query.limit.unwrap_or(20).min(100);
-
-    let config = state.config.lock();
-    let result = cron::list_runs(&config, &id, limit);
-    drop(config);
-
-    match result {
-        Ok(runs) => {
-            let count = runs.len();
-            let body = serde_json::json!({
-                "runs": runs,
-                "count": count,
-                "job_id": id,
-            });
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to list cron runs: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// AUDIT API HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
-
-#[derive(serde::Deserialize)]
-struct AuditLogsQuery {
-    /// Filter by event type (e.g. "command_execution", "policy_violation")
-    #[serde(rename = "type")]
-    event_type: Option<String>,
-    /// Maximum number of entries to return (default 100, max 500)
-    limit: Option<usize>,
-    /// Number of entries to skip (for pagination)
-    offset: Option<usize>,
-}
-
-/// GET /audit/logs — return recent audit log entries from the JSONL audit file
-async fn handle_audit_logs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuditLogsQuery>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    // Audit log lives at {zeroclaw_dir}/audit.log (default).
-    // zeroclaw_dir is config_path's parent directory.
-    let audit_log_path = config
-        .config_path
-        .parent()
-        .map(|p| p.join("audit.log"))
-        .unwrap_or_else(|| std::path::PathBuf::from("audit.log"));
-    drop(config);
-
-    let audit_enabled = true; // always attempt to read if file exists
-
-    if !audit_enabled {
-        let body = serde_json::json!({
-            "entries": [],
-            "count": 0,
-            "total": 0,
-            "enabled": false,
-            "message": "Audit logging is disabled in configuration",
-        });
-        return (StatusCode::OK, Json(body));
-    }
-
-    // Read the JSONL audit log file
-    let content = match std::fs::read_to_string(&audit_log_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let body = serde_json::json!({
-                "entries": [],
-                "count": 0,
-                "total": 0,
-                "enabled": true,
-                "message": "No audit log entries yet",
-            });
-            return (StatusCode::OK, Json(body));
-        }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to read audit log: {e}")});
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
-        }
-    };
-
-    // Parse JSONL lines into audit events, newest first
-    let mut entries: Vec<serde_json::Value> = content
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    entries.reverse(); // newest first
-
-    // Apply type filter
-    if let Some(ref event_type) = query.event_type {
-        entries.retain(|e| {
-            e.get("event_type")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t == event_type.as_str())
-        });
-    }
-
-    let total = entries.len();
-    let offset = query.offset.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).min(500);
-
-    let page: Vec<serde_json::Value> = entries.into_iter().skip(offset).take(limit).collect();
-    let count = page.len();
-
-    let body = serde_json::json!({
-        "entries": page,
-        "count": count,
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "enabled": true,
-    });
-
-    (StatusCode::OK, Json(body))
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// METRICS API HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// GET /metrics — return aggregated metrics snapshot
-///
-/// Since the Observer trait is write-only (no query interface), this endpoint
-/// returns what is available from the health system and basic system counters.
-/// For full time-series metrics, configure the "otel" observer backend with an
-/// external collector (Prometheus, Grafana, etc.).
-async fn handle_metrics(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let health = crate::health::snapshot();
-
-    // Collect memory stats
-    let memory_count = state.mem.count().await.unwrap_or(0);
-    let memory_healthy = state.mem.health_check().await;
-
-    // Collect tools count
-    let tools_count = state.tools_registry.len();
-
-    // Collect cron job stats
-    let config = state.config.lock();
-    let cron_stats = cron::list_jobs(&config).ok().map(|jobs| {
-        let total = jobs.len();
-        let active = jobs.iter().filter(|j| j.enabled).count();
-        serde_json::json!({
-            "total": total,
-            "active": active,
-            "paused": total - active,
-        })
-    });
-    drop(config);
-
-    // Build component health summary
-    let mut components_ok = 0usize;
-    let mut components_error = 0usize;
-    let mut total_restarts = 0u64;
-    for comp in health.components.values() {
-        if comp.status == "ok" {
-            components_ok += 1;
-        } else {
-            components_error += 1;
-        }
-        total_restarts += comp.restart_count;
-    }
-
-    let body = serde_json::json!({
-        "uptime_seconds": health.uptime_seconds,
-        "pid": health.pid,
-        "observer": state.observer.name(),
-        "components": {
-            "ok": components_ok,
-            "error": components_error,
-            "total": health.components.len(),
-            "total_restarts": total_restarts,
-        },
-        "memory": {
-            "backend": state.mem.name(),
-            "count": memory_count,
-            "healthy": memory_healthy,
-        },
-        "tools": {
-            "registered": tools_count,
-        },
-        "cron": cron_stats,
-        "hint": "For time-series metrics, configure observability.backend = \"otel\" with an external collector.",
-    });
-
-    (StatusCode::OK, Json(body))
-}
-
-/// GET /skills — list all installed skills
-async fn handle_skills_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    let workspace_dir = config.workspace_dir.clone();
-    drop(config);
-
-    let all_skills = skills::load_skills(&workspace_dir);
-    let skills_json: Vec<serde_json::Value> = all_skills
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "name": s.name,
-                "description": s.description,
-                "version": s.version,
-                "author": s.author,
-                "tags": s.tags,
-                "tools_count": s.tools.len(),
-                "prompts_count": s.prompts.len(),
-            })
-        })
-        .collect();
-
-    let body = serde_json::json!({
-        "skills": skills_json,
-        "count": all_skills.len(),
-    });
-    (StatusCode::OK, Json(body))
-}
-
-/// GET /skills/{name} — get skill detail
-async fn handle_skills_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    let workspace_dir = config.workspace_dir.clone();
-    drop(config);
-
-    let all_skills = skills::load_skills(&workspace_dir);
-    match all_skills.into_iter().find(|s| s.name == name) {
-        Some(skill) => {
-            let body = serde_json::json!({
-                "name": skill.name,
-                "description": skill.description,
-                "version": skill.version,
-                "author": skill.author,
-                "tags": skill.tags,
-                "tools": skill.tools,
-                "prompts": skill.prompts,
-            });
-            (StatusCode::OK, Json(body))
-        }
-        None => {
-            let err = serde_json::json!({"error": format!("Skill '{}' not found", name)});
-            (StatusCode::NOT_FOUND, Json(err))
-        }
-    }
-}
-
-/// GET /config — return sanitized config (sensitive fields masked)
-async fn handle_config_get(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    let body = serde_json::json!({
-        "default_provider": config.default_provider,
-        "default_model": config.default_model,
-        "default_temperature": config.default_temperature,
-        "api_key": config.api_key.as_ref().map(|_| "***"),
-        "api_url": config.api_url,
-        "autonomy": {
-            "level": config.autonomy.level,
-            "workspace_only": config.autonomy.workspace_only,
-            "max_actions_per_hour": config.autonomy.max_actions_per_hour,
-        },
-        "memory": {
-            "backend": &config.memory.backend,
-            "auto_save": config.memory.auto_save,
-        },
-        "heartbeat": {
-            "enabled": config.heartbeat.enabled,
-            "interval_minutes": config.heartbeat.interval_minutes,
-        },
-        "cron": {
-            "enabled": config.cron.enabled,
-            "max_run_history": config.cron.max_run_history,
-        },
-        "observability": {
-            "backend": &config.observability.backend,
-        },
-        "gateway": {
-            "port": config.gateway.port,
-            "host": &config.gateway.host,
-            "require_pairing": config.gateway.require_pairing,
-        },
-        "cost": {
-            "enabled": config.cost.enabled,
-            "daily_limit_usd": config.cost.daily_limit_usd,
-            "monthly_limit_usd": config.cost.monthly_limit_usd,
-            "warn_at_percent": config.cost.warn_at_percent,
-        },
-        "email_tool": {
-            "enabled": config.email_tool.enabled,
-            "smtp_host": &config.email_tool.smtp_host,
-            "smtp_port": config.email_tool.smtp_port,
-            "smtp_tls": config.email_tool.smtp_tls,
-            "username": &config.email_tool.username,
-            "password": if config.email_tool.password.is_empty() { "" } else { "***" },
-            "from_address": &config.email_tool.from_address,
-            "allowed_recipients": &config.email_tool.allowed_recipients,
-        },
-        "agent": {
-            "max_tool_iterations": config.agent.max_tool_iterations,
-            "max_history_messages": config.agent.max_history_messages,
-            "parallel_tools": config.agent.parallel_tools,
-        },
-    });
-    drop(config);
-
-    (StatusCode::OK, Json(body))
-}
-
-/// PATCH /config — hot-update whitelisted fields
-async fn handle_config_patch(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(patch): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let patch_obj = match patch.as_object() {
-        Some(obj) => obj,
-        None => {
-            let err = serde_json::json!({"error": "Request body must be a JSON object"});
-            return (StatusCode::BAD_REQUEST, Json(err));
-        }
-    };
-
-    // Whitelist of hot-updatable fields
-    let allowed: &[&str] = &[
-        "default_model",
-        "default_temperature",
-        "autonomy_level",
-        "memory_auto_save",
-        "heartbeat_enabled",
-        "heartbeat_interval_minutes",
-    ];
-
-    let mut updated = Vec::new();
-    let mut rejected = Vec::new();
-
-    let mut config = state.config.lock();
-    for (key, value) in patch_obj {
-        if !allowed.contains(&key.as_str()) {
-            rejected.push(key.clone());
-            continue;
-        }
-        match key.as_str() {
-            "default_model" => {
-                if let Some(v) = value.as_str() {
-                    config.default_model = Some(v.to_string());
-                    updated.push(key.clone());
-                }
-            }
-            "default_temperature" => {
-                if let Some(v) = value.as_f64() {
-                    config.default_temperature = v;
-                    updated.push(key.clone());
-                }
-            }
-            "autonomy_level" => {
-                if let Some(v) = value.as_str() {
-                    if let Ok(level) = serde_json::from_value::<crate::security::AutonomyLevel>(
-                        serde_json::Value::String(v.to_string()),
-                    ) {
-                        config.autonomy.level = level;
-                        updated.push(key.clone());
-                    }
-                }
-            }
-            "memory_auto_save" => {
-                if let Some(v) = value.as_bool() {
-                    config.memory.auto_save = v;
-                    updated.push(key.clone());
-                }
-            }
-            "heartbeat_enabled" => {
-                if let Some(v) = value.as_bool() {
-                    config.heartbeat.enabled = v;
-                    updated.push(key.clone());
-                }
-            }
-            "heartbeat_interval_minutes" => {
-                if let Some(v) = value.as_u64() {
-                    if let Ok(minutes) = u32::try_from(v) {
-                        config.heartbeat.interval_minutes = minutes;
-                        updated.push(key.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    drop(config);
-
-    let body = serde_json::json!({
-        "updated": updated,
-        "rejected": rejected,
-        "rejected_reason": if rejected.is_empty() { None } else { Some("Field not in hot-update whitelist. Requires restart.") },
-    });
-    (StatusCode::OK, Json(body))
-}
-
-/// GET /channels — list configured channels with health status
-async fn handle_channels_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        return resp;
-    }
-
-    let config = state.config.lock();
-    let health = crate::health::snapshot();
-
-    let mut channels = Vec::new();
-
-    // Check each channel config
-    let channel_checks: Vec<(&str, bool)> = vec![
-        ("cli", config.channels_config.cli),
-        ("telegram", config.channels_config.telegram.is_some()),
-        ("discord", config.channels_config.discord.is_some()),
-        ("slack", config.channels_config.slack.is_some()),
-        ("mattermost", config.channels_config.mattermost.is_some()),
-        ("webhook", config.channels_config.webhook.is_some()),
-        ("imessage", config.channels_config.imessage.is_some()),
-        ("matrix", config.channels_config.matrix.is_some()),
-        ("signal", config.channels_config.signal.is_some()),
-        ("whatsapp", config.channels_config.whatsapp.is_some()),
-        ("email", config.channels_config.email.is_some()),
-        ("irc", config.channels_config.irc.is_some()),
-        ("lark", config.channels_config.lark.is_some()),
-        ("dingtalk", config.channels_config.dingtalk.is_some()),
-        ("qq", config.channels_config.qq.is_some()),
-    ];
-    drop(config);
-
-    for (name, configured) in &channel_checks {
-        let comp_health = health.components.get(*name);
-        channels.push(serde_json::json!({
-            "name": name,
-            "configured": configured,
-            "status": comp_health.map(|c| c.status.as_str()).unwrap_or("unknown"),
-            "restart_count": comp_health.map(|c| c.restart_count).unwrap_or(0),
-            "last_ok": comp_health.and_then(|c| c.last_ok.as_deref()),
-            "last_error": comp_health.and_then(|c| c.last_error.as_deref()),
-        }));
-    }
-
-    let configured_count = channel_checks.iter().filter(|(_, c)| *c).count();
-    let body = serde_json::json!({
-        "channels": channels,
-        "total": channel_checks.len(),
-        "configured": configured_count,
-    });
-    (StatusCode::OK, Json(body))
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        body,
+    )
 }
 
 /// POST /pair — exchange one-time code for bearer token
+#[axum::debug_handler]
 async fn handle_pair(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_pair(&client_key) {
-        tracing::warn!("/pair rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_pair(&rate_key) {
+        tracing::warn!("/pair rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many pairing requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -1973,10 +657,10 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    match state.pairing.try_pair(code) {
+    match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
-            if let Err(err) = persist_pairing_tokens(&state.config, &state.pairing) {
+            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
                 tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
                 let body = serde_json::json!({
                     "paired": true,
@@ -2013,12 +697,66 @@ async fn handle_pair(
     }
 }
 
-fn persist_pairing_tokens(config: &Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
+async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
     let paired_tokens = pairing.tokens();
-    let mut cfg = config.lock();
-    cfg.gateway.paired_tokens = paired_tokens;
-    cfg.save()
-        .context("Failed to persist paired tokens to config.toml")
+    // This is needed because parking_lot's guard is not Send so we clone the inner
+    // this should be removed once async mutexes are used everywhere
+    let mut updated_cfg = { config.lock().clone() };
+    updated_cfg.gateway.paired_tokens = paired_tokens;
+    updated_cfg
+        .save()
+        .await
+        .context("Failed to persist paired tokens to config.toml")?;
+
+    // Keep shared runtime config in sync with persisted tokens.
+    *config.lock() = updated_cfg;
+    Ok(())
+}
+
+async fn run_gateway_chat_with_multimodal(
+    state: &AppState,
+    provider_label: &str,
+    message: &str,
+) -> anyhow::Result<String> {
+    let user_messages = vec![ChatMessage::user(message)];
+    let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
+    if image_marker_count > 0 && !state.provider.supports_vision() {
+        return Err(ProviderCapabilityError {
+            provider: provider_label.to_string(),
+            capability: "vision".to_string(),
+            message: format!(
+                "received {image_marker_count} image marker(s), but this provider does not support vision input"
+            ),
+        }
+        .into());
+    }
+
+    // Keep webhook/gateway prompts aligned with channel behavior by injecting
+    // workspace-aware system context before model invocation.
+    let system_prompt = {
+        let config_guard = state.config.lock();
+        crate::channels::build_system_prompt(
+            &config_guard.workspace_dir,
+            &state.model,
+            &[], // tools - empty for simple chat
+            &[], // skills
+            Some(&config_guard.identity),
+            None, // bootstrap_max_chars - use default
+        )
+    };
+
+    let mut messages = Vec::with_capacity(1 + user_messages.len());
+    messages.push(ChatMessage::system(system_prompt));
+    messages.extend(user_messages);
+
+    let multimodal_config = state.config.lock().multimodal.clone();
+    let prepared =
+        crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
+
+    state
+        .provider
+        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+        .await
 }
 
 /// Webhook request body
@@ -2034,10 +772,10 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_webhook(&client_key) {
-        tracing::warn!("/webhook rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/webhook rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -2046,9 +784,19 @@ async fn handle_webhook(
     }
 
     // ── Bearer token auth (pairing) ──
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
-        return resp;
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
     }
 
     // ── Webhook secret auth (optional, additional layer) ──
@@ -2101,7 +849,6 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
-    // Auto-save incoming message to memory
     if state.auto_save {
         let key = webhook_memory_key();
         let _ = state
@@ -2110,71 +857,92 @@ async fn handle_webhook(
             .await;
     }
 
-    // Build memory context (recall relevant entries)
-    let memory_context = build_memory_context(state.mem.as_ref(), message).await;
-    let enriched_message = if memory_context.is_empty() {
-        message.clone()
-    } else {
-        format!("{memory_context}{message}")
-    };
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let model_label = state.model.clone();
+    let started_at = Instant::now();
 
-    // Construct conversation history with system prompt
-    let mut history = vec![
-        ChatMessage::system(state.system_prompt.as_str()),
-        ChatMessage::user(&enriched_message),
-    ];
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentStart {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+        });
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::LlmRequest {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+            messages_count: 1,
+        });
 
-    // Run full agent loop with tool support (120s timeout)
-    const WEBHOOK_AGENT_TIMEOUT_SECS: u64 = 120;
-    let history_len_before = history.len();
-    let loop_start = Instant::now();
-    let llm_result = tokio::time::timeout(
-        Duration::from_secs(WEBHOOK_AGENT_TIMEOUT_SECS),
-        run_tool_call_loop(
-            state.provider.as_ref(),
-            &mut history,
-            state.tools_registry.as_ref(),
-            state.observer.as_ref(),
-            "gateway",
-            &state.model,
-            state.temperature,
-            true, // silent — gateway doesn't write to stdout
-            None, // no approval manager for webhook
-            "webhook",
-        ),
-    )
-    .await;
+    match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
+        Ok(response) => {
+            let duration = started_at.elapsed();
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: true,
+                    error_message: None,
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
 
-    match llm_result {
-        Ok(Ok((response, trace))) => {
-            let elapsed_ms = u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            // Extract tool call names from history messages added during the loop.
-            let tool_calls: Vec<String> = history[history_len_before..]
-                .iter()
-                .filter(|m| m.role == "assistant")
-                .flat_map(|m| extract_tool_names_from_history(&m.content))
-                .collect();
-            let body = serde_json::json!({
-                "response": response,
-                "model": state.model,
-                "tool_calls": tool_calls,
-                "duration_ms": elapsed_ms,
-                "trace": trace,
-            });
+            let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
-        Ok(Err(e)) => {
-            tracing::error!(
-                "Webhook agent loop error: {}",
-                providers::sanitize_api_error(&e.to_string())
+        Err(e) => {
+            let duration = started_at.elapsed();
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: false,
+                    error_message: Some(sanitized.clone()),
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
             );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-        Err(_) => {
-            tracing::error!("Webhook agent loop timed out after {WEBHOOK_AGENT_TIMEOUT_SECS}s");
-            let err = serde_json::json!({"error": "Request timed out"});
-            (StatusCode::GATEWAY_TIMEOUT, Json(err))
         }
     }
 }
@@ -2296,6 +1064,12 @@ async fn handle_whatsapp_message(
     }
 
     // Process each message
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
     for msg in &messages {
         tracing::info!(
             "WhatsApp message from {}: {}",
@@ -2312,12 +1086,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        // Call the LLM
-        match state
-            .provider
-            .simple_chat(&msg.content, &state.model, state.temperature)
-            .await
-        {
+        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -2343,6 +1112,229 @@ async fn handle_whatsapp_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
+async fn handle_linq_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref linq) = state.linq else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Linq not configured"})),
+        );
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+
+    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
+    if let Some(ref signing_secret) = state.linq_signing_secret {
+        let timestamp = headers
+            .get("X-Webhook-Timestamp")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let signature = headers
+            .get("X-Webhook-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::linq::verify_linq_signature(
+            signing_secret,
+            &body_str,
+            timestamp,
+            signature,
+        ) {
+            tracing::warn!(
+                "Linq webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from the webhook payload
+    let messages = linq.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        // Acknowledge the webhook even if no messages (could be status/delivery events)
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Process each message
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    for msg in &messages {
+        tracing::info!(
+            "Linq message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        // Auto-save to memory
+        if state.auto_save {
+            let key = linq_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        // Call the LLM
+        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+            Ok(response) => {
+                // Send reply via Linq
+                if let Err(e) = linq
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send Linq reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for Linq message: {e:#}");
+                let _ = linq
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
+async fn handle_nextcloud_talk_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref nextcloud_talk) = state.nextcloud_talk else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Nextcloud Talk not configured"})),
+        );
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+
+    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
+    if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
+        let random = headers
+            .get("X-Nextcloud-Talk-Random")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let signature = headers
+            .get("X-Nextcloud-Talk-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
+            webhook_secret,
+            random,
+            &body_str,
+            signature,
+        ) {
+            tracing::warn!(
+                "Nextcloud Talk webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from webhook payload
+    let messages = nextcloud_talk.parse_webhook_payload(&payload);
+    if messages.is_empty() {
+        // Acknowledge webhook even if payload does not contain actionable user messages.
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    for msg in &messages {
+        tracing::info!(
+            "Nextcloud Talk message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        if state.auto_save {
+            let key = nextcloud_talk_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+            Ok(response) => {
+                if let Err(e) = nextcloud_talk
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                let _ = nextcloud_talk
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2356,14 +1348,20 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
+    fn generate_test_secret() -> String {
+        let bytes: [u8; 32] = rand::random();
+        hex::encode(bytes)
+    }
+
     #[test]
     fn security_body_limit_is_64kb() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
     }
 
     #[test]
-    fn security_timeout_accommodates_agent_loop() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 120);
+    fn security_timeout_is_30_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
     }
 
     #[test]
@@ -2392,6 +1390,82 @@ mod tests {
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROMETHEUS_CONTENT_TYPE)
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Prometheus backend not enabled"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_renders_prometheus_output() {
+        let prom = Arc::new(crate::observability::PrometheusObserver::new());
+        crate::observability::Observer::record_event(
+            prom.as_ref(),
+            &crate::observability::ObserverEvent::HeartbeatTick,
+        );
+
+        let observer: Arc<dyn crate::observability::Observer> = prom;
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer,
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
     }
 
     #[test]
@@ -2529,8 +1603,8 @@ mod tests {
         assert_eq!(normalize_max_keys(1, 10_000), 1);
     }
 
-    #[test]
-    fn persist_pairing_tokens_writes_config_tokens() {
+    #[tokio::test]
+    async fn persist_pairing_tokens_writes_config_tokens() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         let workspace_path = temp.path().join("workspace");
@@ -2538,22 +1612,28 @@ mod tests {
         let mut config = Config::default();
         config.config_path = config_path.clone();
         config.workspace_dir = workspace_path;
-        config.save().unwrap();
+        config.save().await.unwrap();
 
         let guard = PairingGuard::new(true, &[]);
         let code = guard.pairing_code().unwrap();
-        let token = guard.try_pair(&code).unwrap().unwrap();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(Mutex::new(config));
-        persist_pairing_tokens(&shared_config, &guard).unwrap();
+        persist_pairing_tokens(shared_config.clone(), &guard)
+            .await
+            .unwrap();
 
-        let saved = std::fs::read_to_string(config_path).unwrap();
+        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
         assert_eq!(parsed.gateway.paired_tokens.len(), 1);
         let persisted = &parsed.gateway.paired_tokens[0];
         assert_eq!(persisted.len(), 64);
         assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let in_memory = shared_config.lock();
+        assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
+        assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
     }
 
     #[test]
@@ -2575,6 +1655,7 @@ mod tests {
             content: "hello".into(),
             channel: "whatsapp".into(),
             timestamp: 1,
+            thread_ts: None,
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -2734,9 +1815,11 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
-            tools_registry: Arc::new(vec![]),
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
-            system_prompt: Arc::new(String::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2792,9 +1875,11 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
-            tools_registry: Arc::new(vec![]),
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
-            system_prompt: Arc::new(String::new()),
         };
 
         let headers = HeaderMap::new();
@@ -2830,9 +1915,11 @@ mod tests {
 
     #[test]
     fn webhook_secret_hash_is_deterministic_and_nonempty() {
-        let one = hash_webhook_secret("secret-value");
-        let two = hash_webhook_secret("secret-value");
-        let other = hash_webhook_secret("other-value");
+        let secret_a = generate_test_secret();
+        let secret_b = generate_test_secret();
+        let one = hash_webhook_secret(&secret_a);
+        let two = hash_webhook_secret(&secret_a);
+        let other = hash_webhook_secret(&secret_b);
 
         assert_eq!(one, two);
         assert_ne!(one, other);
@@ -2844,6 +1931,7 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -2852,16 +1940,18 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
-            tools_registry: Arc::new(vec![]),
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
-            system_prompt: Arc::new(String::new()),
         };
 
         let response = handle_webhook(
@@ -2884,6 +1974,8 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let valid_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -2892,20 +1984,25 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
-            tools_registry: Arc::new(vec![]),
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
-            system_prompt: Arc::new(String::new()),
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("wrong-secret"));
+        headers.insert(
+            "X-Webhook-Secret",
+            HeaderValue::from_str(&wrong_secret).unwrap(),
+        );
 
         let response = handle_webhook(
             State(state),
@@ -2927,6 +2024,7 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -2935,20 +2033,22 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
-            tools_registry: Arc::new(vec![]),
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
-            system_prompt: Arc::new(String::new()),
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("super-secret"));
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
 
         let response = handle_webhook(
             State(state),
@@ -2963,6 +2063,109 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let payload = format!("{random}{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+        };
+
+        let response = handle_nextcloud_talk_webhook(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"type":"message"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_invalid_signature() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            vec!["*".into()],
+        ));
+
+        let secret = "nextcloud-test-secret";
+        let random = "seed-value";
+        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
+        let invalid_signature = "deadbeef";
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: Some(channel),
+            nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            observer: Arc::new(crate::observability::NoopObserver),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(invalid_signature).unwrap(),
+        );
+
+        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
     // ══════════════════════════════════════════════════════════
@@ -2984,14 +2187,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_valid() {
-        // Test with known values
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -2999,14 +2201,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_secret() {
-        let app_secret = "correct_secret_key_abc";
-        let wrong_secret = "wrong_secret_key_xyz";
+        let app_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(wrong_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3014,15 +2216,15 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let original_body = b"original body";
         let tampered_body = b"tampered body";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, original_body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, original_body);
 
         // Verify with tampered body should fail
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             tampered_body,
             &signature_header
         ));
@@ -3030,14 +2232,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_missing_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Signature without "sha256=" prefix
         let signature_header = "abc123def456";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -3045,22 +2247,22 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_header() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        assert!(!verify_whatsapp_signature(app_secret, body, ""));
+        assert!(!verify_whatsapp_signature(&app_secret, body, ""));
     }
 
     #[test]
     fn whatsapp_signature_invalid_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Invalid hex characters
         let signature_header = "sha256=not_valid_hex_zzz";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -3068,13 +2270,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3082,13 +2284,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_unicode_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = "Hello 🦀 World".as_bytes();
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3096,13 +2298,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_json_payload() {
-        let app_secret = "test_app_secret_key_xyz";
+        let app_secret = generate_test_secret();
         let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3110,31 +2312,35 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_case_sensitive_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
 
         // Wrong case prefix should fail
         let wrong_prefix = format!("SHA256={hex_sig}");
-        assert!(!verify_whatsapp_signature(app_secret, body, &wrong_prefix));
+        assert!(!verify_whatsapp_signature(&app_secret, body, &wrong_prefix));
 
         // Correct prefix should pass
         let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(app_secret, body, &correct_prefix));
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &correct_prefix
+        ));
     }
 
     #[test]
     fn whatsapp_signature_truncated_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let truncated = &hex_sig[..32]; // Only half the signature
         let signature_header = format!("sha256={truncated}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3142,17 +2348,65 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_extra_bytes() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let extended = format!("{hex_sig}deadbeef");
         let signature_header = format!("sha256={extended}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // IdempotencyStore Edge-Case Tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn idempotency_store_allows_different_keys() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 100);
+        assert!(store.record_if_new("key-a"));
+        assert!(store.record_if_new("key-b"));
+        assert!(store.record_if_new("key-c"));
+        assert!(store.record_if_new("key-d"));
+    }
+
+    #[test]
+    fn idempotency_store_max_keys_clamped_to_one() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 0);
+        assert!(store.record_if_new("only-key"));
+        assert!(!store.record_if_new("only-key"));
+    }
+
+    #[test]
+    fn idempotency_store_rapid_duplicate_rejected() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 100);
+        assert!(store.record_if_new("rapid"));
+        assert!(!store.record_if_new("rapid"));
+    }
+
+    #[test]
+    fn idempotency_store_accepts_after_ttl_expires() {
+        let store = IdempotencyStore::new(Duration::from_millis(1), 100);
+        assert!(store.record_if_new("ttl-key"));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.record_if_new("ttl-key"));
+    }
+
+    #[test]
+    fn idempotency_store_eviction_preserves_newest() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 1);
+        assert!(store.record_if_new("old-key"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("new-key"));
+
+        let keys = store.keys.lock();
+        assert_eq!(keys.len(), 1);
+        assert!(!keys.contains_key("old-key"));
+        assert!(keys.contains_key("new-key"));
     }
 }
