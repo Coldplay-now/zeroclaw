@@ -315,7 +315,7 @@ function JobCard({
     <Card className={!job.enabled ? "opacity-60" : ""}>
       <CardContent className="p-4">
         <div className="flex items-start justify-between">
-          <div className="flex-1 cursor-pointer" onClick={onToggleExpand}>
+          <div className="flex-1 min-w-0 cursor-pointer" onClick={onToggleExpand}>
             <div className="flex items-center gap-2 flex-wrap">
               <span className="font-medium text-sm">
                 {job.name || job.id.slice(0, 8)}
