@@ -59,6 +59,10 @@ export function Chat() {
           {
             role: "assistant",
             content: `Error: ${result.error ?? "Unknown error"}`,
+            model: result.model,
+            toolCalls: result.tool_calls,
+            durationMs: result.duration_ms,
+            trace: result.trace,
           },
         ]);
       }
