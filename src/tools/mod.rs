@@ -17,7 +17,6 @@
 
 pub mod browser;
 pub mod browser_open;
-pub mod calculator;
 pub mod composio;
 pub mod cron_add;
 pub mod cron_list;
@@ -26,7 +25,6 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
-pub mod email_send;
 pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
@@ -51,7 +49,6 @@ pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
-pub use calculator::CalculatorTool;
 pub use composio::ComposioTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
@@ -60,7 +57,6 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
-pub use email_send::EmailSendTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;

@@ -169,12 +169,6 @@ pub struct Config {
 
     /// Identity format configuration: OpenClaw or AIEOS (`[identity]`).
     #[serde(default)]
-    pub email_tool: EmailToolConfig,
-
-    #[serde(default)]
-    pub web_search: WebSearchConfig,
-
-    #[serde(default)]
     pub identity: IdentityConfig,
 
     /// Cost tracking and budget enforcement configuration (`[cost]`).
@@ -3150,6 +3144,31 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 }
 
 impl Config {
+    /// Ensure workspace path is usable by runtime commands.
+    pub fn validate_workspace(&self) -> Result<()> {
+        if self.workspace_dir.as_os_str().is_empty() {
+            anyhow::bail!("Workspace directory is empty");
+        }
+
+        if self.workspace_dir.exists() {
+            if !self.workspace_dir.is_dir() {
+                anyhow::bail!(
+                    "Workspace path is not a directory: {}",
+                    self.workspace_dir.display()
+                );
+            }
+            return Ok(());
+        }
+
+        std::fs::create_dir_all(&self.workspace_dir).with_context(|| {
+            format!(
+                "Failed to create workspace directory: {}",
+                self.workspace_dir.display()
+            )
+        })?;
+        Ok(())
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -5319,12 +5338,10 @@ default_temperature = 0.7
     async fn env_override_workspace() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        let original_workspace = config.workspace_dir.clone();
 
         std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
         config.apply_env_overrides();
-        // workspace_dir should remain unchanged — it's handled by load_or_init
-        assert_eq!(config.workspace_dir, original_workspace);
+        assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
     }

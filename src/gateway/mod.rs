@@ -9,14 +9,12 @@
 
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
-use crate::cron;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::skills;
-use crate::tools::{self, Tool};
+use crate::tools;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -29,7 +27,6 @@ use axum::{
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::fmt::Write as FmtWrite;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,9 +36,8 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout — prevents slow-loris attacks.
-/// Set to 120s to accommodate the full agent tool-call loop.
-pub const REQUEST_TIMEOUT_SECS: u64 = 120;
+/// Request timeout (30s) — prevents slow-loris attacks
+pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -354,7 +350,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -368,45 +364,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     ));
-
-    // ── Observer for agent loop events ──
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
-
-    // ── System prompt from workspace identity files + tool instructions ──
-    let skills = crate::skills::load_skills(&config.workspace_dir);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
-        ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
-        ("memory_store", "Save to memory."),
-        ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-    ];
-    if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved URLs in browser."));
-    }
-    if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
-    }
-    if !config.agents.is_empty() {
-        tool_descs.push(("delegate", "Delegate a sub-task to a specialized agent."));
-    }
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
-    let mut system_prompt = crate::channels::build_system_prompt(
-        &config.workspace_dir,
-        &model,
-        &tool_descs,
-        &skills,
-        Some(&config.identity),
-        bootstrap_max_chars,
-    );
-    system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
-
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -827,9 +784,19 @@ async fn handle_webhook(
     }
 
     // ── Bearer token auth (pairing) ──
-    if let Err(resp) = verify_bearer_token(&state, &headers) {
-        tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
-        return resp;
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
     }
 
     // ── Webhook secret auth (optional, additional layer) ──
@@ -882,7 +849,6 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
-    // Auto-save incoming message to memory
     if state.auto_save {
         let key = webhook_memory_key();
         let _ = state
@@ -977,11 +943,6 @@ async fn handle_webhook(
             tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-        Err(_) => {
-            tracing::error!("Webhook agent loop timed out after {WEBHOOK_AGENT_TIMEOUT_SECS}s");
-            let err = serde_json::json!({"error": "Request timed out"});
-            (StatusCode::GATEWAY_TIMEOUT, Json(err))
         }
     }
 }
@@ -1399,8 +1360,8 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_accommodates_agent_loop() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 120);
+    fn security_timeout_is_30_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
     }
 
     #[test]

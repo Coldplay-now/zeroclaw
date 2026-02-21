@@ -12,7 +12,6 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
-use serde::Serialize;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -977,7 +976,7 @@ pub(crate) async fn agent_turn(
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
 ) -> Result<String> {
-    let (response, _trace) = run_tool_call_loop(
+    run_tool_call_loop(
         provider,
         history,
         tools_registry,
@@ -993,8 +992,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
     )
-    .await?;
-    Ok(response)
+    .await
 }
 
 async fn execute_one_tool(
@@ -1203,7 +1201,7 @@ pub(crate) async fn run_tool_call_loop(
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
-            messages_count,
+            messages_count: history.len(),
         });
 
         let llm_started_at = Instant::now();
@@ -1323,10 +1321,7 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            trace.iterations = iteration + 1;
-            trace.total_duration_ms =
-                u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            return Ok((display_text, trace));
+            return Ok(display_text);
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
@@ -1563,10 +1558,6 @@ pub async fn run(
             "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
         ),
         (
-            "calculator",
-            "Evaluate math expressions inside the agent process (no shell). Use when: arithmetic, formula checks, and deterministic numeric reasoning.",
-        ),
-        (
             "memory_store",
             "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
         ),
@@ -1716,7 +1707,7 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let (response, _trace) = run_tool_call_loop(
+        let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
             &tools_registry,
@@ -1853,7 +1844,7 @@ pub async fn run(
             )
             .await
             {
-                Ok((resp, _trace)) => resp,
+                Ok(resp) => resp,
                 Err(e) => {
                     eprintln!("\nError: {e}\n");
                     continue;
@@ -1986,7 +1977,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
         ("file_write", "Write file contents."),
-        ("calculator", "Evaluate math expressions in-process."),
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
