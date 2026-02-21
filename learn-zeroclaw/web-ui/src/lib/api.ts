@@ -269,6 +269,26 @@ export async function deleteMemory(
   });
 }
 
+// ── Traces ────────────────────────────────────────────────────────────────
+
+export interface TraceResponse {
+  session_id: string;
+  trace: AgentTrace;
+}
+
+export async function getTrace(
+  sessionId: string,
+): Promise<TraceResponse | null> {
+  try {
+    return await apiFetch<TraceResponse>(
+      `/traces/${encodeURIComponent(sessionId)}`,
+      { headers: { ...authHeaders() } },
+    );
+  } catch {
+    return null;
+  }
+}
+
 // ── Tools ─────────────────────────────────────────────────────────────────
 
 export interface ToolSummary {

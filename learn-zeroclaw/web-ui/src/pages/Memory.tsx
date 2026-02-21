@@ -7,8 +7,11 @@ import {
   searchMemory,
   storeMemory,
   deleteMemory,
+  getTrace,
   type MemoryEntry,
+  type AgentTrace,
 } from "@/lib/api";
+import { TraceInspector } from "@/components/TraceInspector";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
@@ -22,6 +25,14 @@ import {
   Heart,
   ChevronDown,
   ChevronUp,
+  ZoomIn,
+  Tag,
+  Clock,
+  Hash,
+  Link,
+  FileText,
+  Layers,
+  Loader2,
 } from "lucide-react";
 
 const CATEGORIES = ["core", "daily", "conversation"] as const;
@@ -34,6 +45,7 @@ export function Memory() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [expandedEntry, setExpandedEntry] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [inspectedEntry, setInspectedEntry] = useState<MemoryEntry | null>(null);
 
   const [newKey, setNewKey] = useState("");
   const [newContent, setNewContent] = useState("");
@@ -108,7 +120,8 @@ export function Memory() {
   }
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="flex h-full overflow-hidden">
+    <div className="flex-1 overflow-y-auto p-6 space-y-6 min-w-0">
       {/* Header */}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">{t("title")}</h1>
@@ -305,6 +318,19 @@ export function Memory() {
                     </p>
                   </div>
                   <div className="flex items-center gap-1 ml-2 shrink-0">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 text-muted-foreground hover:text-primary"
+                      onClick={() =>
+                        setInspectedEntry(
+                          inspectedEntry?.id === entry.id ? null : entry,
+                        )
+                      }
+                      title="Inspect"
+                    >
+                      <ZoomIn className="h-3.5 w-3.5" />
+                    </Button>
                     {confirmDelete === entry.key ? (
                       <>
                         <Button
@@ -346,6 +372,178 @@ export function Memory() {
             </Card>
           ))
         )}
+      </div>
+    </div>
+
+    {/* Memory Inspector Panel */}
+    {inspectedEntry && (
+      <MemoryInspector
+        entry={inspectedEntry}
+        onClose={() => setInspectedEntry(null)}
+      />
+    )}
+    </div>
+  );
+}
+
+function MemoryInspector({
+  entry,
+  onClose,
+}: {
+  entry: MemoryEntry;
+  onClose: () => void;
+}) {
+  const [trace, setTrace] = useState<AgentTrace | null>(null);
+  const [traceLoading, setTraceLoading] = useState(false);
+  const [traceError, setTraceError] = useState<string | null>(null);
+  const [showTrace, setShowTrace] = useState(false);
+
+  const handleLoadTrace = async () => {
+    if (!entry.session_id) return;
+    setTraceLoading(true);
+    setTraceError(null);
+    const result = await getTrace(entry.session_id);
+    setTraceLoading(false);
+    if (result) {
+      setTrace(result.trace);
+      setShowTrace(true);
+    } else {
+      setTraceError("Trace not found for this session");
+    }
+  };
+
+  // When showing the full TraceInspector panel, render it in place of the memory details
+  if (showTrace && trace) {
+    return (
+      <div className="w-80 flex flex-col border-l bg-background shrink-0 h-full min-h-0">
+        {/* Back button strip */}
+        <div className="flex items-center gap-2 px-3 py-2 border-b shrink-0">
+          <button
+            onClick={() => setShowTrace(false)}
+            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <ZoomIn className="h-3 w-3" />
+            ← Memory
+          </button>
+          <span className="text-xs text-muted-foreground truncate flex-1 text-right font-mono">
+            {entry.key}
+          </span>
+        </div>
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <TraceInspector trace={trace} onClose={onClose} />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-80 flex flex-col border-l bg-background shrink-0 h-full min-h-0">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b shrink-0">
+        <div className="flex items-center gap-2">
+          <ZoomIn className="h-4 w-4 text-primary" />
+          <span className="text-sm font-semibold">Memory Inspector</span>
+        </div>
+        <button
+          onClick={onClose}
+          className="p-1 rounded hover:bg-muted transition-colors"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      {/* Key + Category summary */}
+      <div className="px-4 py-3 border-b shrink-0 space-y-1">
+        <div className="flex items-center gap-2 text-xs">
+          <Hash className="h-3 w-3 text-muted-foreground shrink-0" />
+          <span className="font-mono font-medium break-all">{entry.key}</span>
+        </div>
+        <div className="flex items-center gap-2 text-xs">
+          <Tag className="h-3 w-3 text-muted-foreground shrink-0" />
+          <span className="bg-muted px-1.5 py-0.5 rounded text-[10px]">
+            {entry.category}
+          </span>
+          {entry.score != null && (
+            <span className="text-muted-foreground">
+              score: {entry.score.toFixed(3)}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className="px-4 py-3 space-y-4">
+          {/* Content */}
+          <div>
+            <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">
+              <FileText className="h-3 w-3" />
+              Content
+            </div>
+            <pre className="text-xs font-mono bg-muted rounded p-3 whitespace-pre-wrap break-all leading-relaxed">
+              {entry.content}
+            </pre>
+          </div>
+
+          {/* Metadata */}
+          <div>
+            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">
+              Metadata
+            </div>
+            <div className="space-y-2 text-xs">
+              <div className="flex items-start gap-2">
+                <span className="text-muted-foreground shrink-0 w-16">ID</span>
+                <span className="font-mono break-all text-[10px]">{entry.id}</span>
+              </div>
+              <div className="flex items-start gap-2">
+                <Clock className="h-3 w-3 text-muted-foreground shrink-0 mt-0.5" />
+                <span className="font-mono text-[10px] break-all">
+                  {entry.timestamp}
+                </span>
+              </div>
+              {entry.session_id && (
+                <div className="flex items-start gap-2">
+                  <Link className="h-3 w-3 text-muted-foreground shrink-0 mt-0.5" />
+                  <span className="font-mono text-[10px] break-all text-blue-600">
+                    {entry.session_id}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* RE-ACT Trace */}
+          {entry.session_id && (
+            <div>
+              <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">
+                <Layers className="h-3 w-3" />
+                RE-ACT Trace
+              </div>
+              {traceError ? (
+                <p className="text-xs text-muted-foreground">{traceError}</p>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full text-xs"
+                  onClick={handleLoadTrace}
+                  disabled={traceLoading}
+                >
+                  {traceLoading ? (
+                    <>
+                      <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
+                      Loading trace...
+                    </>
+                  ) : (
+                    <>
+                      <Layers className="h-3 w-3 mr-1.5" />
+                      View Execution Trace
+                    </>
+                  )}
+                </Button>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

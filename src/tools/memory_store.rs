@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolResult};
 use crate::memory::{Memory, MemoryCategory};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::gateway::CURRENT_SESSION_ID;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -78,7 +79,12 @@ impl Tool for MemoryStoreTool {
             });
         }
 
-        match self.memory.store(key, content, category, None).await {
+        let session_id = CURRENT_SESSION_ID.try_with(Clone::clone).ok();
+        match self
+            .memory
+            .store(key, content, category, session_id.as_deref())
+            .await
+        {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Stored memory: {key}"),

@@ -7,6 +7,12 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+/// Task-local session ID, set by the webhook handler before running the agent so that
+/// downstream tools (e.g. `memory_store`) can tag their side-effects with the originating session.
+tokio::task_local! {
+    pub(crate) static CURRENT_SESSION_ID: String;
+}
+
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::cron;
@@ -295,6 +301,8 @@ pub struct AppState {
     pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// SQLite backend used to persist/retrieve agent traces; None for non-SQLite backends
+    pub trace_store: Option<Arc<crate::memory::SqliteMemory>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -339,6 +347,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    // Trace store: reuse the same SQLite DB for agent trace persistence (sqlite backend only)
+    let trace_store: Option<Arc<crate::memory::SqliteMemory>> =
+        if memory::backend::classify_memory_backend(&config.memory.backend)
+            == memory::backend::MemoryBackendKind::Sqlite
+        {
+            match crate::memory::SqliteMemory::new(&config.workspace_dir) {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!("Could not open SQLite for trace storage: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -574,6 +597,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk_webhook_secret,
         tools_registry,
         observer,
+        trace_store,
     };
 
     // Build router with middleware
@@ -623,6 +647,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/skills/{name}", get(handle_skills_get))
         // Channels API (bearer token required)
         .route("/channels", get(handle_channels_list))
+        // Traces API (bearer token required)
+        .route("/traces/{session_id}", get(handle_trace_get))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1209,11 +1235,15 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
+    // Generate a unique session ID for this request so memory entries and the
+    // resulting trace can be linked together.
+    let session_id = uuid::Uuid::new_v4().to_string();
+
     if state.auto_save {
         let key = webhook_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
+            .store(&key, message, MemoryCategory::Conversation, Some(&session_id))
             .await;
     }
 
@@ -1240,7 +1270,16 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_trace(&state, &provider_label, message).await {
+    // Run the agent loop inside a task-local scope so tools (e.g. memory_store) can
+    // read CURRENT_SESSION_ID and tag their side-effects with this session.
+    let run_result = CURRENT_SESSION_ID
+        .scope(
+            session_id.clone(),
+            run_gateway_chat_with_trace(&state, &provider_label, message),
+        )
+        .await;
+
+    match run_result {
         Ok(output) => {
             let duration = started_at.elapsed();
             state
@@ -1265,6 +1304,13 @@ async fn handle_webhook(
                     cost_usd: None,
                 });
 
+            // Persist trace so it can be retrieved later via GET /traces/{session_id}
+            if let Some(ref ts) = state.trace_store {
+                if let Ok(trace_json) = serde_json::to_string(&output.trace) {
+                    let _ = ts.store_trace(&session_id, &trace_json).await;
+                }
+            }
+
             let tool_calls: Vec<String> = output
                 .trace
                 .steps
@@ -1282,6 +1328,7 @@ async fn handle_webhook(
                 "duration_ms": duration.as_millis(),
                 "tool_calls": tool_calls,
                 "trace": output.trace,
+                "session_id": session_id,
             });
             (StatusCode::OK, Json(body))
         }
@@ -2824,6 +2871,40 @@ async fn handle_channels_list(
     (StatusCode::OK, Json(body))
 }
 
+/// GET /traces/{session_id} — retrieve a persisted agent trace by session ID
+async fn handle_trace_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let Some(ref ts) = state.trace_store else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Trace storage not available (non-SQLite backend)" })),
+        );
+    };
+
+    match ts.get_trace(&session_id).await {
+        Ok(Some(json_str)) => {
+            let trace: serde_json::Value =
+                serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
+            (StatusCode::OK, Json(serde_json::json!({ "session_id": session_id, "trace": trace })))
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Trace not found", "session_id": session_id })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to retrieve trace: {e}") })),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2903,6 +2984,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
+            trace_store: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2949,6 +3031,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             tools_registry: Arc::new(vec![]),
             observer,
+            trace_store: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -3312,6 +3395,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
+            trace_store: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3373,6 +3457,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
+            trace_store: None,
         };
 
         let headers = HeaderMap::new();
@@ -3446,6 +3531,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
+            trace_store: None,
         };
 
         let response = handle_webhook(
@@ -3491,6 +3577,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
+            trace_store: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3541,6 +3628,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
+            trace_store: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3596,6 +3684,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
+            trace_store: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -3647,6 +3736,7 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
+            trace_store: None,
         };
 
         let mut headers = HeaderMap::new();

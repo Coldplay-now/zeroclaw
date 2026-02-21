@@ -183,6 +183,15 @@ impl SqliteMemory {
             )?;
         }
 
+        // Migration: agent_traces table for RE-ACT trace history
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_traces (
+                session_id  TEXT PRIMARY KEY,
+                trace_json  TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );",
+        )?;
+
         Ok(())
     }
 
@@ -427,6 +436,43 @@ impl SqliteMemory {
         }
 
         Ok(count)
+    }
+
+    /// Persist an agent trace JSON keyed by session_id.
+    pub async fn store_trace(&self, session_id: &str, trace_json: &str) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let sid = session_id.to_string();
+        let json = trace_json.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let now = chrono::Local::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO agent_traces (session_id, trace_json, created_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET trace_json = excluded.trace_json",
+                rusqlite::params![sid, json, now],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Retrieve a stored agent trace JSON by session_id, returns None if not found.
+    pub async fn get_trace(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.clone();
+        let sid = session_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare("SELECT trace_json FROM agent_traces WHERE session_id = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![sid])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
     }
 }
 
