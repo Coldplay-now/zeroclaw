@@ -11,6 +11,15 @@ use uuid::Uuid;
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
+fn ensure_https(url: &str) -> anyhow::Result<()> {
+    if !url.starts_with("https://") {
+        anyhow::bail!(
+            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
+        );
+    }
+    Ok(())
+}
+
 /// Deduplication set capacity — evict half of entries when full.
 const DEDUP_CAPACITY: usize = 10_000;
 
@@ -20,7 +29,6 @@ pub struct QQChannel {
     app_id: String,
     app_secret: String,
     allowed_users: Vec<String>,
-    client: reqwest::Client,
     /// Cached access token + expiry timestamp.
     token_cache: Arc<RwLock<Option<(String, u64)>>>,
     /// Message deduplication set.
@@ -33,10 +41,13 @@ impl QQChannel {
             app_id,
             app_secret,
             allowed_users,
-            client: reqwest::Client::new(),
             token_cache: Arc::new(RwLock::new(None)),
             dedup: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.qq")
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
@@ -50,7 +61,12 @@ impl QQChannel {
             "clientSecret": self.app_secret,
         });
 
-        let resp = self.client.post(QQ_AUTH_URL).json(&body).send().await?;
+        let resp = self
+            .http_client()
+            .post(QQ_AUTH_URL)
+            .json(&body)
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -109,7 +125,7 @@ impl QQChannel {
     /// Get the WebSocket gateway URL.
     async fn get_gateway_url(&self, token: &str) -> anyhow::Result<String> {
         let resp = self
-            .client
+            .http_client()
             .get(format!("{QQ_API_BASE}/gateway"))
             .header("Authorization", format!("QQBot {token}"))
             .send()
@@ -189,8 +205,10 @@ impl Channel for QQChannel {
             )
         };
 
+        ensure_https(&url)?;
+
         let resp = self
-            .client
+            .http_client()
             .post(&url)
             .header("Authorization", format!("QQBot {token}"))
             .json(&body)
@@ -245,7 +263,9 @@ impl Channel for QQChannel {
                 }
             }
         });
-        write.send(Message::Text(identify.to_string())).await?;
+        write
+            .send(Message::Text(identify.to_string().into()))
+            .await?;
 
         tracing::info!("QQ: connected and identified");
 
@@ -269,7 +289,11 @@ impl Channel for QQChannel {
                 _ = hb_rx.recv() => {
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
-                    if write.send(Message::Text(hb.to_string())).await.is_err() {
+                    if write
+                        .send(Message::Text(hb.to_string().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -280,7 +304,7 @@ impl Channel for QQChannel {
                         _ => continue,
                     };
 
-                    let event: serde_json::Value = match serde_json::from_str(&msg) {
+                    let event: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
@@ -297,7 +321,11 @@ impl Channel for QQChannel {
                         1 => {
                             let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                             let hb = json!({"op": 1, "d": d});
-                            if write.send(Message::Text(hb.to_string())).await.is_err() {
+                            if write
+                                .send(Message::Text(hb.to_string().into()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                             continue;
@@ -359,6 +387,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -397,6 +426,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

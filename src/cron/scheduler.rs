@@ -9,44 +9,42 @@ use crate::cron::{
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use futures_util::{stream, StreamExt};
+use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
 
 const MIN_POLL_SECONDS: u64 = 5;
+const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+const SCHEDULER_COMPONENT: &str = "scheduler";
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
-    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
 
-    crate::health::mark_component_ok("scheduler");
+    crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
     loop {
         interval.tick().await;
+        // Keep scheduler liveness fresh even when there are no due jobs.
+        crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
         let jobs = match due_jobs(&config, Utc::now()) {
             Ok(jobs) => jobs,
             Err(e) => {
-                crate::health::mark_component_error("scheduler", e.to_string());
+                crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
                 tracing::warn!("Scheduler query failed: {e}");
                 continue;
             }
         };
 
-        for job in jobs {
-            crate::health::mark_component_ok("scheduler");
-            warn_if_high_frequency_agent_job(&job);
-
-            let started_at = Utc::now();
-            let (success, output) = execute_job_with_retry(&config, &security, &job).await;
-            let finished_at = Utc::now();
-            let success =
-                persist_job_result(&config, &job, success, &output, started_at, finished_at).await;
-
-            if !success {
-                crate::health::mark_component_error("scheduler", format!("job {} failed", job.id));
-            }
-        }
+        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
     }
 }
 
@@ -67,7 +65,7 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, job).await,
+            JobType::Agent => run_agent_job(config, security, job).await,
         };
         last_output = output;
 
@@ -90,7 +88,78 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
+async fn process_due_jobs(
+    config: &Config,
+    security: &Arc<SecurityPolicy>,
+    jobs: Vec<CronJob>,
+    component: &str,
+) {
+    // Refresh scheduler health on every successful poll cycle, including idle cycles.
+    crate::health::mark_component_ok(component);
+
+    let max_concurrent = config.scheduler.max_concurrent.max(1);
+    let mut in_flight =
+        stream::iter(
+            jobs.into_iter().map(|job| {
+                let config = config.clone();
+                let security = Arc::clone(security);
+                let component = component.to_owned();
+                async move {
+                    execute_and_persist_job(&config, security.as_ref(), &job, &component).await
+                }
+            }),
+        )
+        .buffer_unordered(max_concurrent);
+
+    while let Some((job_id, success)) = in_flight.next().await {
+        if !success {
+            tracing::warn!("Scheduler job '{job_id}' failed");
+        }
+    }
+}
+
+async fn execute_and_persist_job(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    component: &str,
+) -> (String, bool) {
+    crate::health::mark_component_ok(component);
+    warn_if_high_frequency_agent_job(job);
+
+    let started_at = Utc::now();
+    let (success, output) = execute_job_with_retry(config, security, job).await;
+    let finished_at = Utc::now();
+    let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
+
+    (job.id.clone(), success)
+}
+
+async fn run_agent_job(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
+    if !security.can_act() {
+        return (
+            false,
+            "blocked by security policy: autonomy is read-only".to_string(),
+        );
+    }
+
+    if security.is_rate_limited() {
+        return (
+            false,
+            "blocked by security policy: rate limit exceeded".to_string(),
+        );
+    }
+
+    if !security.record_action() {
+        return (
+            false,
+            "blocked by security policy: action budget exhausted".to_string(),
+        );
+    }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
@@ -233,7 +302,11 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .telegram
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let channel = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone());
+            let channel = TelegramChannel::new(
+                tg.bot_token.clone(),
+                tg.allowed_users.clone(),
+                tg.mention_only,
+            );
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
@@ -275,6 +348,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 mm.bot_token.clone(),
                 mm.channel_id.clone(),
                 mm.allowed_users.clone(),
+                mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
@@ -347,6 +422,21 @@ async fn run_job_command(
     security: &SecurityPolicy,
     job: &CronJob,
 ) -> (bool, String) {
+    run_job_command_with_timeout(
+        config,
+        security,
+        job,
+        Duration::from_secs(SHELL_JOB_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn run_job_command_with_timeout(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    timeout: Duration,
+) -> (bool, String) {
     if !security.can_act() {
         return (
             false,
@@ -385,15 +475,22 @@ async fn run_job_command(
         );
     }
 
-    let output = Command::new("sh")
+    let child = match Command::new("sh")
         .arg("-lc")
         .arg(&job.command)
         .current_dir(&config.workspace_dir)
-        .output()
-        .await;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return (false, format!("spawn error: {e}")),
+    };
 
-    match output {
-        Ok(output) => {
+    match time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = format!(
@@ -404,7 +501,11 @@ async fn run_job_command(
             );
             (output.status.success(), combined)
         }
-        Err(e) => (false, format!("spawn error: {e}")),
+        Ok(Err(e)) => (false, format!("spawn error: {e}")),
+        Err(_) => (
+            false,
+            format!("job timed out after {}s", timeout.as_secs_f64()),
+        ),
     }
 }
 
@@ -417,13 +518,15 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
 
-    fn test_config(tmp: &TempDir) -> Config {
+    async fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         config
     }
 
@@ -452,10 +555,14 @@ mod tests {
         }
     }
 
+    fn unique_component(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
     #[tokio::test]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let job = test_job("echo scheduler-ok");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -468,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_scheduler_test");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -479,9 +586,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_command_times_out() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["sleep".into()];
+        let job = test_job("sleep 1");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) =
+            run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
+        assert!(!success);
+        assert!(output.contains("job timed out after"));
+    }
+
+    #[tokio::test]
     async fn run_job_command_blocks_disallowed_command() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.autonomy.allowed_commands = vec!["echo".into()];
         let job = test_job("curl https://evil.example");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -495,7 +616,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_blocks_forbidden_path_argument() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.autonomy.allowed_commands = vec!["cat".into()];
         let job = test_job("cat /etc/passwd");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -510,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_blocks_readonly_mode() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
         let job = test_job("echo should-not-run");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -524,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_blocks_rate_limited() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.autonomy.max_actions_per_hour = 0;
         let job = test_job("echo should-not-run");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -538,16 +659,17 @@ mod tests {
     #[tokio::test]
     async fn execute_job_with_retry_recovers_after_first_failure() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
         config.autonomy.allowed_commands = vec!["sh".into()];
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        std::fs::write(
+        tokio::fs::write(
             config.workspace_dir.join("retry-once.sh"),
             "#!/bin/sh\nif [ -f retry-ok.flag ]; then\n  echo recovered\n  exit 0\nfi\ntouch retry-ok.flag\nexit 1\n",
         )
+        .await
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
@@ -559,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn execute_job_with_retry_exhausts_attempts() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -574,20 +696,92 @@ mod tests {
     #[tokio::test]
     async fn run_agent_job_returns_error_without_provider_key() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &job).await;
+        let (success, output) = run_agent_job(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
 
     #[tokio::test]
+    async fn run_agent_job_blocks_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_blocks_rate_limited() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.max_actions_per_hour = 0;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_marks_component_ok_even_when_idle() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let component = unique_component("scheduler-idle");
+
+        crate::health::mark_component_error(&component, "pre-existing error");
+        process_due_jobs(&config, &security, Vec::new(), &component).await;
+
+        let snapshot = crate::health::snapshot_json();
+        let entry = &snapshot["components"][component.as_str()];
+        assert_eq!(entry["status"], "ok");
+        assert!(entry["last_ok"].as_str().is_some());
+        assert!(entry["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_failure_does_not_mark_component_unhealthy() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let component = unique_component("scheduler-fail");
+
+        crate::health::mark_component_ok(&component);
+        process_due_jobs(&config, &security, vec![job], &component).await;
+
+        let snapshot = crate::health::snapshot_json();
+        let entry = &snapshot["components"][component.as_str()];
+        assert_eq!(entry["status"], "ok");
+    }
+
+    #[tokio::test]
     async fn persist_job_result_records_run_and_reschedules_shell_job() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -604,7 +798,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_success_deletes_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_agent_job(
             &config,
@@ -629,7 +823,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_failure_disables_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_agent_job(
             &config,
@@ -655,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_if_configured_handles_none_and_invalid_channel() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let mut job = test_job("echo ok");
 
         assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
