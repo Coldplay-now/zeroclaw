@@ -1,0 +1,5 @@
+{"id":"smoke-001","category":"qa","prompt":"用三句话解释什么是 ZeroClaw，并给出一个适合新手的入门顺序。","expectation":"应提到 ZeroClaw 是 Agent Runtime，并包含清晰的入门步骤。"}
+{"id":"smoke-002","category":"planning","prompt":"给出一个本地运行 ZeroClaw（前后端）的最小排障清单，按优先级排序。","expectation":"应包含端口、健康检查、pair/token、日志检查等关键项。"}
+{"id":"smoke-003","category":"tools","prompt":"请为“将来引入 RE-TRAC”列出 5 个可量化指标，并说明每个指标的采集方式。","expectation":"指标需可量化，且包含采集口径。"}
+{"id":"smoke-004","category":"scheduler","prompt":"假设有一个每天 9 点执行的任务，说明如何验证它是否执行成功并发送到了 Telegram。","expectation":"应覆盖任务状态、运行记录、投递状态与失败重试。"}
+{"id":"smoke-005","category":"cost","prompt":"如何在不降低成功率的前提下减少工具调用次数？给出可执行策略。","expectation":"应给出去重、提前停止、失败熔断等策略。"}
