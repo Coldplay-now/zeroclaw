@@ -35,6 +35,8 @@ const mockConfig = {
     trajectory_compression_enabled: true,
     trajectory_state_max_items: 6,
     trajectory_max_rounds: 8,
+    trajectory_stop_on_redundant_rounds: 2,
+    trajectory_tool_call_dedup_window: 3,
   },
   channels_config: { message_timeout_secs: 300 },
   scheduler: { max_concurrent: 4, max_tasks: 64 },
@@ -72,6 +74,8 @@ describe("Settings", () => {
     renderWithProviders(<Settings />);
     expect(await screen.findByDisplayValue("gpt-4o")).toBeInTheDocument();
     expect(screen.getByDisplayValue("0.7")).toBeInTheDocument();
+    expect(screen.getAllByDisplayValue("2").length).toBeGreaterThan(0);
+    expect(screen.getAllByDisplayValue("3").length).toBeGreaterThan(0);
   });
 
   it("显示只读网关配置", async () => {

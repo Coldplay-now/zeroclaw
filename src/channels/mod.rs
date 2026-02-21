@@ -60,7 +60,7 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop_with_policy};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -1486,7 +1486,7 @@ async fn process_channel_message(
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop(
+            run_tool_call_loop_with_policy(
                 active_provider.as_ref(),
                 &mut history,
                 ctx.tools_registry.as_ref(),
@@ -1502,6 +1502,8 @@ async fn process_channel_message(
                 true,
                 6,
                 ctx.max_tool_iterations,
+                2,
+                3,
                 Some(cancellation_token.clone()),
                 delta_tx,
             ),

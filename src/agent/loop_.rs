@@ -12,7 +12,10 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use serde_json::Value;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -25,6 +28,10 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+/// Number of consecutive redundant trajectory rounds before early stop.
+const DEFAULT_TRAJECTORY_STOP_ON_REDUNDANT_ROUNDS: usize = 2;
+/// Number of recent rounds to deduplicate equivalent tool calls against.
+const DEFAULT_TRAJECTORY_TOOL_CALL_DEDUP_WINDOW: usize = 3;
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -939,7 +946,7 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParsedToolCall {
     name: String,
     arguments: serde_json::Value,
@@ -975,6 +982,8 @@ pub enum AgentStepTrace {
         duration_ms: u128,
         success: bool,
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_duplicate: Option<bool>,
     },
 }
 
@@ -984,6 +993,8 @@ pub struct AgentTrace {
     pub total_duration_ms: u128,
     pub iterations: usize,
     pub trajectory_states: Vec<TrajectoryState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1004,6 +1015,13 @@ struct ToolExecutionRecord {
     duration_ms: u128,
     success: bool,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolCallRoundRecord {
+    call: ParsedToolCall,
+    result: ToolExecutionRecord,
+    is_duplicate: bool,
 }
 
 fn extract_objective(history: &[ChatMessage]) -> String {
@@ -1112,6 +1130,111 @@ fn build_trajectory_state(
     }
 }
 
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let mut out = serde_json::Map::new();
+            for (key, val) in entries {
+                out.insert(key.clone(), canonicalize_json_value(val));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn tool_call_signature(call: &ParsedToolCall) -> String {
+    let canonical = canonicalize_json_value(&call.arguments);
+    format!("{}|{}", call.name, canonical)
+}
+
+fn collect_recent_signatures(recent: &VecDeque<HashSet<String>>, window: usize) -> HashSet<String> {
+    if window == 0 {
+        return HashSet::new();
+    }
+    recent
+        .iter()
+        .rev()
+        .take(window)
+        .flat_map(|round| round.iter().cloned())
+        .collect()
+}
+
+fn build_tool_call_round_records(
+    tool_calls: &[ParsedToolCall],
+    execution_results: Vec<ToolExecutionRecord>,
+    recent_signatures: &VecDeque<HashSet<String>>,
+    dedup_window: usize,
+) -> (Vec<ToolCallRoundRecord>, HashSet<String>) {
+    let recent = collect_recent_signatures(recent_signatures, dedup_window);
+    let mut seen_this_round: HashSet<String> = HashSet::new();
+    let mut executed_signatures: HashSet<String> = HashSet::new();
+    let mut execution_iter = execution_results.into_iter();
+    let mut records = Vec::with_capacity(tool_calls.len());
+
+    for call in tool_calls {
+        let signature = tool_call_signature(call);
+        let duplicate_in_round = seen_this_round.contains(&signature);
+        let duplicate_in_window = dedup_window > 0 && recent.contains(&signature);
+        let is_duplicate = duplicate_in_round || duplicate_in_window;
+
+        if is_duplicate {
+            let reason = if duplicate_in_round {
+                "duplicate_in_current_round"
+            } else {
+                "duplicate_in_recent_rounds"
+            };
+            records.push(ToolCallRoundRecord {
+                call: call.clone(),
+                result: ToolExecutionRecord {
+                    output: format!("Skipped duplicate tool call ({reason})."),
+                    duration_ms: 0,
+                    success: true,
+                    error: None,
+                },
+                is_duplicate: true,
+            });
+            continue;
+        }
+
+        seen_this_round.insert(signature.clone());
+        executed_signatures.insert(signature);
+        let result = execution_iter.next().unwrap_or(ToolExecutionRecord {
+            output: "Skipped tool call due to missing execution result.".to_string(),
+            duration_ms: 0,
+            success: false,
+            error: Some("missing_execution_result".to_string()),
+        });
+        records.push(ToolCallRoundRecord {
+            call: call.clone(),
+            result,
+            is_duplicate: false,
+        });
+    }
+
+    (records, executed_signatures)
+}
+
+fn trajectory_state_signature(state: &TrajectoryState) -> u64 {
+    let normalize = |items: &[String]| {
+        let mut normalized: Vec<String> = items
+            .iter()
+            .map(|item| item.trim().to_ascii_lowercase())
+            .filter(|item| !item.is_empty())
+            .collect();
+        normalized.sort();
+        normalized
+    };
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    normalize(&state.next_plan).hash(&mut hasher);
+    normalize(&state.uncertainties).hash(&mut hasher);
+    hasher.finish()
+}
+
 #[derive(Debug)]
 pub(crate) struct ToolLoopCancelled;
 
@@ -1203,7 +1326,10 @@ async fn execute_one_tool(
             let output = if success {
                 scrub_credentials(&r.output)
             } else {
-                format!("Error: {}", r.error.clone().unwrap_or_else(|| r.output.clone()))
+                format!(
+                    "Error: {}",
+                    r.error.clone().unwrap_or_else(|| r.output.clone())
+                )
             };
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
@@ -1366,7 +1492,7 @@ pub(crate) async fn run_tool_call_loop(
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
-    let output = run_tool_call_loop_with_trace(
+    let output = run_tool_call_loop_with_trace_and_policy(
         provider,
         history,
         tools_registry,
@@ -1382,6 +1508,8 @@ pub(crate) async fn run_tool_call_loop(
         trajectory_compression_enabled,
         trajectory_state_max_items,
         trajectory_max_rounds,
+        DEFAULT_TRAJECTORY_STOP_ON_REDUNDANT_ROUNDS,
+        DEFAULT_TRAJECTORY_TOOL_CALL_DEDUP_WINDOW,
         cancellation_token,
         on_delta,
     )
@@ -1409,6 +1537,99 @@ pub(crate) async fn run_tool_call_loop_with_trace(
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<ToolLoopOutput> {
+    run_tool_call_loop_with_trace_and_policy(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        multimodal_config,
+        max_tool_iterations,
+        trajectory_compression_enabled,
+        trajectory_state_max_items,
+        trajectory_max_rounds,
+        DEFAULT_TRAJECTORY_STOP_ON_REDUNDANT_ROUNDS,
+        DEFAULT_TRAJECTORY_TOOL_CALL_DEDUP_WINDOW,
+        cancellation_token,
+        on_delta,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop_with_policy(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    trajectory_compression_enabled: bool,
+    trajectory_state_max_items: usize,
+    trajectory_max_rounds: usize,
+    trajectory_stop_on_redundant_rounds: usize,
+    trajectory_tool_call_dedup_window: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+) -> Result<String> {
+    let output = run_tool_call_loop_with_trace_and_policy(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        multimodal_config,
+        max_tool_iterations,
+        trajectory_compression_enabled,
+        trajectory_state_max_items,
+        trajectory_max_rounds,
+        trajectory_stop_on_redundant_rounds,
+        trajectory_tool_call_dedup_window,
+        cancellation_token,
+        on_delta,
+    )
+    .await?;
+    Ok(output.response)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop_with_trace_and_policy(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    trajectory_compression_enabled: bool,
+    trajectory_state_max_items: usize,
+    trajectory_max_rounds: usize,
+    trajectory_stop_on_redundant_rounds: usize,
+    trajectory_tool_call_dedup_window: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+) -> Result<ToolLoopOutput> {
     let iteration_limit = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -1423,9 +1644,14 @@ pub(crate) async fn run_tool_call_loop_with_trace(
     let loop_started_at = Instant::now();
     let mut trace_steps: Vec<AgentStepTrace> = Vec::new();
     let mut trajectory_states: Vec<TrajectoryState> = Vec::new();
+    let mut recent_tool_call_signatures: VecDeque<HashSet<String>> = VecDeque::new();
+    let mut previous_trajectory_signature: Option<u64> = None;
+    let mut redundant_round_streak: usize = 0;
     let objective = extract_objective(history);
     let trajectory_enabled = trajectory_compression_enabled;
     let trajectory_state_max_items = trajectory_state_max_items.max(1);
+    let dedup_window = trajectory_tool_call_dedup_window;
+    let stop_threshold = trajectory_stop_on_redundant_rounds;
 
     let tool_specs: Vec<crate::tools::ToolSpec> =
         tools_registry.iter().map(|tool| tool.spec()).collect();
@@ -1454,7 +1680,9 @@ pub(crate) async fn run_tool_call_loop_with_trace(
         let prepared_history: Vec<ChatMessage> = if trajectory_enabled {
             if let Some(prev_state) = trajectory_states.last() {
                 let mut with_state = history.clone();
-                with_state.push(ChatMessage::system(trajectory_state_prompt_block(prev_state)));
+                with_state.push(ChatMessage::system(trajectory_state_prompt_block(
+                    prev_state,
+                )));
                 with_state
             } else {
                 history.clone()
@@ -1615,6 +1843,7 @@ pub(crate) async fn run_tool_call_loop_with_trace(
                     total_duration_ms: loop_started_at.elapsed().as_millis(),
                     iterations: iteration + 1,
                     trajectory_states,
+                    early_stop_reason: None,
                 },
             });
         }
@@ -1631,10 +1860,21 @@ pub(crate) async fn run_tool_call_loop_with_trace(
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
         let mut tool_results = String::new();
-        let should_parallel = should_execute_tools_in_parallel(&tool_calls, approval);
-        let individual_results = if should_parallel {
+        let recent = collect_recent_signatures(&recent_tool_call_signatures, dedup_window);
+        let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut seen_executable_signatures: HashSet<String> = HashSet::new();
+        for call in &tool_calls {
+            let signature = tool_call_signature(call);
+            if recent.contains(&signature) || seen_executable_signatures.contains(&signature) {
+                continue;
+            }
+            seen_executable_signatures.insert(signature);
+            executable_calls.push(call.clone());
+        }
+        let should_parallel = should_execute_tools_in_parallel(&executable_calls, approval);
+        let execution_results = if should_parallel {
             execute_tools_parallel(
-                &tool_calls,
+                &executable_calls,
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
@@ -1642,7 +1882,7 @@ pub(crate) async fn run_tool_call_loop_with_trace(
             .await?
         } else {
             execute_tools_sequential(
-                &tool_calls,
+                &executable_calls,
                 tools_registry,
                 observer,
                 approval,
@@ -1651,32 +1891,58 @@ pub(crate) async fn run_tool_call_loop_with_trace(
             )
             .await?
         };
+        let (round_records, executed_signatures) = build_tool_call_round_records(
+            &tool_calls,
+            execution_results,
+            &recent_tool_call_signatures,
+            dedup_window,
+        );
+        recent_tool_call_signatures.push_back(executed_signatures);
+        if recent_tool_call_signatures.len() > dedup_window.max(1) {
+            recent_tool_call_signatures.pop_front();
+        }
 
-        for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
+        for record in &round_records {
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, result.output
+                record.call.name, record.result.output
             );
             trace_steps.push(AgentStepTrace::ToolCall {
-                tool: call.name.clone(),
-                arguments: call.arguments.clone(),
-                output_preview: truncate_with_ellipsis(&result.output, 260),
-                duration_ms: result.duration_ms,
-                success: result.success,
-                error: result.error.clone(),
+                tool: record.call.name.clone(),
+                arguments: record.call.arguments.clone(),
+                output_preview: truncate_with_ellipsis(&record.result.output, 260),
+                duration_ms: record.result.duration_ms,
+                success: record.result.success,
+                error: record.result.error.clone(),
+                is_duplicate: Some(record.is_duplicate),
             });
         }
 
+        let mut early_stop_reason: Option<String> = None;
         if trajectory_enabled {
-            trajectory_states.push(build_trajectory_state(
+            let current_state = build_trajectory_state(
                 iteration + 1,
                 &objective,
                 &display_text,
                 &tool_calls,
-                &individual_results,
+                &round_records
+                    .iter()
+                    .map(|record| record.result.clone())
+                    .collect::<Vec<_>>(),
                 trajectory_state_max_items,
-            ));
+            );
+            let signature = trajectory_state_signature(&current_state);
+            if previous_trajectory_signature == Some(signature) {
+                redundant_round_streak += 1;
+            } else {
+                redundant_round_streak = 1;
+            }
+            previous_trajectory_signature = Some(signature);
+            trajectory_states.push(current_state);
+            if stop_threshold > 0 && redundant_round_streak >= stop_threshold {
+                early_stop_reason = Some("redundant_rounds".to_string());
+            }
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -1687,13 +1953,31 @@ pub(crate) async fn run_tool_call_loop_with_trace(
         if native_tool_calls.is_empty() {
             history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
         } else {
-            for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
+            for (native_call, record) in native_tool_calls.iter().zip(round_records.iter()) {
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
-                    "content": result.output,
+                    "content": record.result.output,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
+        }
+
+        if let Some(reason) = early_stop_reason {
+            let response = if display_text.trim().is_empty() {
+                "Stopped early because trajectory states became redundant.".to_string()
+            } else {
+                display_text.clone()
+            };
+            return Ok(ToolLoopOutput {
+                response,
+                trace: AgentTrace {
+                    steps: trace_steps,
+                    total_duration_ms: loop_started_at.elapsed().as_millis(),
+                    iterations: iteration + 1,
+                    trajectory_states,
+                    early_stop_reason: Some(reason),
+                },
+            });
         }
     }
 
@@ -2021,7 +2305,7 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let response = run_tool_call_loop(
+        let response = run_tool_call_loop_with_policy(
             provider.as_ref(),
             &mut history,
             &tools_registry,
@@ -2037,6 +2321,8 @@ pub async fn run(
             config.agent.trajectory_compression_enabled,
             config.agent.trajectory_state_max_items,
             config.agent.trajectory_max_rounds,
+            config.agent.trajectory_stop_on_redundant_rounds,
+            config.agent.trajectory_tool_call_dedup_window,
             None,
             None,
         )
@@ -2143,7 +2429,7 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
-            let response = match run_tool_call_loop(
+            let response = match run_tool_call_loop_with_policy(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,
@@ -2159,6 +2445,8 @@ pub async fn run(
                 config.agent.trajectory_compression_enabled,
                 config.agent.trajectory_state_max_items,
                 config.agent.trajectory_max_rounds,
+                config.agent.trajectory_stop_on_redundant_rounds,
+                config.agent.trajectory_tool_call_dedup_window,
                 None,
                 None,
             )
@@ -2377,7 +2665,7 @@ pub async fn process_message_with_trace(
         ChatMessage::user(&enriched),
     ];
 
-    let output = run_tool_call_loop_with_trace(
+    let output = run_tool_call_loop_with_trace_and_policy(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -2393,6 +2681,8 @@ pub async fn process_message_with_trace(
         config.agent.trajectory_compression_enabled,
         config.agent.trajectory_state_max_items,
         config.agent.trajectory_max_rounds,
+        config.agent.trajectory_stop_on_redundant_rounds,
+        config.agent.trajectory_tool_call_dedup_window,
         None,
         None,
     )
@@ -2558,6 +2848,56 @@ mod tests {
         delay_ms: u64,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
+    }
+
+    struct CountingTool {
+        name: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingTool {
+        fn new(name: &str, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                name: name.to_string(),
+                calls,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Counting tool for dedup tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let value = args
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: format!("counted:{value}"),
+                error: None,
+            })
+        }
     }
 
     impl DelayTool {
@@ -2894,6 +3234,116 @@ mod tests {
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_deduplicates_tool_calls_in_same_round() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"echo","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"echo","arguments":{"value":"A"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(CountingTool::new("echo", Arc::clone(&calls)))];
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run duplicate tools"),
+        ];
+
+        let output = run_tool_call_loop_with_trace_and_policy(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "channel",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            true,
+            6,
+            8,
+            0,
+            3,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(output.response, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let tool_steps: Vec<_> = output
+            .trace
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                AgentStepTrace::ToolCall { is_duplicate, .. } => Some(*is_duplicate),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_steps.len(), 2);
+        assert_eq!(tool_steps[0], Some(false));
+        assert_eq!(tool_steps[1], Some(true));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_stops_early_on_redundant_trajectory_rounds() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"echo","arguments":{"value":"A"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"echo","arguments":{"value":"A"}}
+</tool_call>"#,
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(CountingTool::new("echo", Arc::clone(&calls)))];
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat until stopped"),
+        ];
+
+        let output = run_tool_call_loop_with_trace_and_policy(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "channel",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            true,
+            6,
+            8,
+            2,
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect("redundant rounds should stop gracefully");
+
+        assert_eq!(
+            output.trace.early_stop_reason.as_deref(),
+            Some("redundant_rounds")
+        );
+        assert_eq!(output.trace.iterations, 2);
     }
 
     #[test]
@@ -3958,6 +4408,7 @@ Let me check the result."#;
             None, // no identity config
             None, // no bootstrap_max_chars
             true, // native_tools
+            crate::config::SkillsPromptInjectionMode::Full,
         );
 
         // Must contain zero XML protocol artifacts

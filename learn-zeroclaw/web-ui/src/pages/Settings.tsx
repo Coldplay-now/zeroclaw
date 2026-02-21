@@ -309,6 +309,38 @@ export function Settings() {
             hint={t("rangeHint", { min: 1, max: 50 })}
           />
           <SettingField
+            label={t("agentTrajectoryStopOnRedundantRounds")}
+            value={
+              draft.agent_trajectory_stop_on_redundant_rounds !== undefined
+                ? String(draft.agent_trajectory_stop_on_redundant_rounds)
+                : String(config.agent.trajectory_stop_on_redundant_rounds)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                agent_trajectory_stop_on_redundant_rounds: parseInt(v, 10) || 0,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 0, max: 10 })}
+          />
+          <SettingField
+            label={t("agentTrajectoryToolCallDedupWindow")}
+            value={
+              draft.agent_trajectory_tool_call_dedup_window !== undefined
+                ? String(draft.agent_trajectory_tool_call_dedup_window)
+                : String(config.agent.trajectory_tool_call_dedup_window)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                agent_trajectory_tool_call_dedup_window: parseInt(v, 10) || 0,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 0, max: 20 })}
+          />
+          <SettingField
             label={t("channelsMessageTimeoutSecs")}
             value={
               draft.channels_message_timeout_secs !== undefined

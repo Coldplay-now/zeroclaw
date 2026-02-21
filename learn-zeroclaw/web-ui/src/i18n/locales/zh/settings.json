@@ -40,6 +40,8 @@
   "agentTrajectoryCompressionEnabled": "轨迹压缩开关",
   "agentTrajectoryStateMaxItems": "轨迹状态每类最大条目",
   "agentTrajectoryMaxRounds": "轨迹最大轮次",
+  "agentTrajectoryStopOnRedundantRounds": "冗余轮次提前停止阈值",
+  "agentTrajectoryToolCallDedupWindow": "工具调用去重窗口",
   "channelsMessageTimeoutSecs": "频道消息超时（秒）",
   "schedulerMaxConcurrent": "调度最大并发",
   "schedulerMaxTasks": "调度最大任务数",

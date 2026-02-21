@@ -655,10 +655,7 @@ fn redacted_api_key(api_key: Option<&str>) -> Option<String> {
 }
 
 /// GET /config — return dashboard-safe config view (no plaintext secrets).
-async fn handle_get_config(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_get_config(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(resp) = require_pairing_auth(&state, &headers) {
         return resp;
     }
@@ -707,7 +704,9 @@ async fn handle_get_config(
             "parallel_tools": cfg.agent.parallel_tools,
             "trajectory_compression_enabled": cfg.agent.trajectory_compression_enabled,
             "trajectory_state_max_items": cfg.agent.trajectory_state_max_items,
-            "trajectory_max_rounds": cfg.agent.trajectory_max_rounds
+            "trajectory_max_rounds": cfg.agent.trajectory_max_rounds,
+            "trajectory_stop_on_redundant_rounds": cfg.agent.trajectory_stop_on_redundant_rounds,
+            "trajectory_tool_call_dedup_window": cfg.agent.trajectory_tool_call_dedup_window
         },
         "channels_config": {
             "message_timeout_secs": cfg.channels_config.message_timeout_secs
@@ -846,6 +845,22 @@ async fn handle_patch_config(
                 .filter(|v| (1..=50).contains(v))
                 .map(|v| {
                     cfg.agent.trajectory_max_rounds = v as usize;
+                    true
+                })
+                .unwrap_or(false),
+            "agent_trajectory_stop_on_redundant_rounds" => value
+                .as_u64()
+                .filter(|v| *v <= 10)
+                .map(|v| {
+                    cfg.agent.trajectory_stop_on_redundant_rounds = v as usize;
+                    true
+                })
+                .unwrap_or(false),
+            "agent_trajectory_tool_call_dedup_window" => value
+                .as_u64()
+                .filter(|v| *v <= 20)
+                .map(|v| {
+                    cfg.agent.trajectory_tool_call_dedup_window = v as usize;
                     true
                 })
                 .unwrap_or(false),

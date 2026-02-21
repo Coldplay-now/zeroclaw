@@ -326,6 +326,12 @@ pub struct AgentConfig {
     /// Maximum trajectory rounds for a single message.
     #[serde(default = "default_agent_trajectory_max_rounds")]
     pub trajectory_max_rounds: usize,
+    /// Consecutive redundant trajectory rounds before early stop (0 disables).
+    #[serde(default = "default_agent_trajectory_stop_on_redundant_rounds")]
+    pub trajectory_stop_on_redundant_rounds: usize,
+    /// Cross-round deduplication window for equivalent tool calls (0 disables).
+    #[serde(default = "default_agent_trajectory_tool_call_dedup_window")]
+    pub trajectory_tool_call_dedup_window: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -352,6 +358,14 @@ fn default_agent_trajectory_max_rounds() -> usize {
     8
 }
 
+fn default_agent_trajectory_stop_on_redundant_rounds() -> usize {
+    2
+}
+
+fn default_agent_trajectory_tool_call_dedup_window() -> usize {
+    3
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -363,6 +377,9 @@ impl Default for AgentConfig {
             trajectory_compression_enabled: default_agent_trajectory_compression_enabled(),
             trajectory_state_max_items: default_agent_trajectory_state_max_items(),
             trajectory_max_rounds: default_agent_trajectory_max_rounds(),
+            trajectory_stop_on_redundant_rounds: default_agent_trajectory_stop_on_redundant_rounds(
+            ),
+            trajectory_tool_call_dedup_window: default_agent_trajectory_tool_call_dedup_window(),
         }
     }
 }
@@ -3327,6 +3344,12 @@ impl Config {
         if !(1..=50).contains(&self.agent.trajectory_max_rounds) {
             anyhow::bail!("agent.trajectory_max_rounds must be in range 1..=50");
         }
+        if self.agent.trajectory_stop_on_redundant_rounds > 10 {
+            anyhow::bail!("agent.trajectory_stop_on_redundant_rounds must be in range 0..=10");
+        }
+        if self.agent.trajectory_tool_call_dedup_window > 20 {
+            anyhow::bail!("agent.trajectory_tool_call_dedup_window must be in range 0..=20");
+        }
 
         // Scheduler
         if self.scheduler.max_concurrent == 0 {
@@ -4154,6 +4177,8 @@ reasoning_enabled = false
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert_eq!(cfg.trajectory_stop_on_redundant_rounds, 2);
+        assert_eq!(cfg.trajectory_tool_call_dedup_window, 3);
     }
 
     #[test]
@@ -4166,6 +4191,8 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+trajectory_stop_on_redundant_rounds = 4
+trajectory_tool_call_dedup_window = 7
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
@@ -4173,6 +4200,8 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
+        assert_eq!(parsed.agent.trajectory_stop_on_redundant_rounds, 4);
+        assert_eq!(parsed.agent.trajectory_tool_call_dedup_window, 7);
     }
 
     #[tokio::test]

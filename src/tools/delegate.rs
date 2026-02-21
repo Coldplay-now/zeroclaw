@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::loop_::run_tool_call_loop_with_policy;
 use crate::config::DelegateAgentConfig;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
@@ -394,7 +394,7 @@ impl DelegateTool {
 
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
-            run_tool_call_loop(
+            run_tool_call_loop_with_policy(
                 provider,
                 &mut history,
                 &sub_tools,
@@ -410,6 +410,8 @@ impl DelegateTool {
                 true,
                 6,
                 agent_config.max_iterations,
+                2,
+                3,
                 None,
                 None,
             ),

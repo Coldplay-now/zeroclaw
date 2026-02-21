@@ -53,6 +53,7 @@ export interface AgentStep {
   tool?: string;
   arguments?: Record<string, unknown>;
   output_preview?: string;
+  is_duplicate?: boolean | null;
 }
 
 export interface TrajectoryState {
@@ -70,6 +71,7 @@ export interface AgentTrace {
   total_duration_ms: number;
   iterations: number;
   trajectory_states?: TrajectoryState[];
+  early_stop_reason?: string | null;
 }
 
 export interface MessageResponse {
@@ -526,6 +528,8 @@ export interface ConfigResponse {
     trajectory_compression_enabled: boolean;
     trajectory_state_max_items: number;
     trajectory_max_rounds: number;
+    trajectory_stop_on_redundant_rounds: number;
+    trajectory_tool_call_dedup_window: number;
   };
   channels_config: { message_timeout_secs: number };
   scheduler: { max_concurrent: number; max_tasks: number };

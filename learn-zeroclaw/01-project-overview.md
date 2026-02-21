@@ -66,6 +66,8 @@ graph TB
         MsgIn["Message In"] --> MemRecall["Memory Recall<br/>ctx"]
         MemRecall --> LLM["LLM<br/>AI"]
         LLM --> Tools["Tools<br/>exec"]
+        Tools --> Trajectory["Trajectory State<br/><i>objective/evidence/failures/next</i>"]
+        Trajectory --> LLM
         Tools --> MemSave["Memory Save<br/>store"]
         MemSave --> MsgOut["Response Out"]
         Composio["Composio<br/><i>1000+ OAuth</i>"]
@@ -137,6 +139,7 @@ graph TB
                                     ┌─ Memory Recall (混合检索上下文)
                                     ├─ LLM 推理 (22+ Provider)
                                     ├─ Tool 执行 (30 个工具)
+                                    ├─ Trajectory State 压缩（多轮目标/证据/失败/下一步）
                                     ├─ Memory Save (存储新知识)
                                     └─ Response Out → Chat Apps → 用户
 ```
@@ -363,10 +366,32 @@ allowed_commands = ["git", "cargo", "npm"]
 [gateway]
 require_pairing = true
 
+[agent]
+max_tool_iterations = 10
+max_history_messages = 40
+trajectory_compression_enabled = true
+trajectory_state_max_items = 6
+trajectory_max_rounds = 8
+
 [channels_config.telegram]
 token = "..."
 allowlist = ["@user1", "123456789"]
 ```
+
+### 轨迹压缩相关配置说明（RE-TRAC-lite）
+
+- `agent.trajectory_compression_enabled`：是否开启轨迹压缩（建议默认开启）。
+- `agent.trajectory_state_max_items`：每个轨迹分区最多保留条目数（当前校验范围 `1..=20`）。
+- `agent.trajectory_max_rounds`：单次消息允许的轨迹轮次上限（当前校验范围 `1..=50`）。
+- `agent.max_tool_iterations` / `agent.max_history_messages`：已统一为可配置项，且要求大于 0。
+- Web 端可通过 `GET /config` 与 `PATCH /config` 进行热更新（受白名单字段约束）。
+
+### 当前阶段评测结论（timeout=120s）
+
+- 对照口径：`20` 题、`repeats=3`、总计 `60` 组 ON/OFF 对照。
+- 核心结果：ON（开启轨迹压缩）成功率 `100%`，OFF 为 `93.33%`。
+- 时延结果：平均时延约 `-3.3s`，P95 从 `120s` 降至约 `53.8s`。
+- 记录级结论：简单任务上两组互有胜负，但 ON 在关键长尾任务上“失败转成功”更明显。
 
 ---
 
@@ -452,6 +477,9 @@ strip = true          # 去除符号
 | 14 | `13-retrac-for-zeroclaw.md` | RE-TRAC 方法解读与 ZeroClaw 落地方案 |
 | 15 | `eval/README.md` | RE-TRAC 引入前基线评测框架与执行方法 |
 | 16 | `14-retrac-phase-a-task-plan.md` | RE-TRAC-lite Phase A 任务计划与里程碑 |
+| 17 | `eval/reports/compare-on-off-timeout120.md` | RE-TRAC ON/OFF 对照结论与记录级分析 |
+| 18 | `eval/reports/quality-review-template.md` | 人工质量抽检模板（配合 rubric 使用） |
+| 19 | `15-agent-loop-rs-program-design.md` | `src/agent/loop_.rs` 的程序分层与执行链路设计 |
 
 > 说明：学习文档会持续迭代，建议优先按本索引顺序阅读，后续再结合源码做深挖。
 

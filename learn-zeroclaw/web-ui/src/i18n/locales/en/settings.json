@@ -40,6 +40,8 @@
   "agentTrajectoryCompressionEnabled": "Trajectory Compression Enabled",
   "agentTrajectoryStateMaxItems": "Trajectory State Max Items",
   "agentTrajectoryMaxRounds": "Trajectory Max Rounds",
+  "agentTrajectoryStopOnRedundantRounds": "Stop On Redundant Rounds",
+  "agentTrajectoryToolCallDedupWindow": "Tool Call Dedup Window",
   "channelsMessageTimeoutSecs": "Channel Message Timeout (sec)",
   "schedulerMaxConcurrent": "Scheduler Max Concurrent",
   "schedulerMaxTasks": "Scheduler Max Tasks",

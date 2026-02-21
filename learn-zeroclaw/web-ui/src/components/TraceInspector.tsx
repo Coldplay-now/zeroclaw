@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { AgentTrace, AgentStep, TrajectoryState } from "@/lib/api";
@@ -22,6 +22,13 @@ interface TraceInspectorProps {
 
 export function TraceInspector({ trace, model, onClose }: TraceInspectorProps) {
   const { t } = useTranslation("chat");
+  const duplicateCalls = useMemo(
+    () =>
+      trace.steps.filter(
+        (step) => step.type === "ToolCall" && step.is_duplicate === true,
+      ).length,
+    [trace.steps],
+  );
 
   return (
     <div className="flex flex-col h-full border-l bg-background">
@@ -66,7 +73,17 @@ export function TraceInspector({ trace, model, onClose }: TraceInspectorProps) {
               ? t("inspector.step", "step")
               : t("inspector.steps", "steps")}
           </span>
+          {duplicateCalls > 0 && (
+            <span className="text-amber-600">
+              Duplicates skipped: {duplicateCalls}
+            </span>
+          )}
         </div>
+        {trace.early_stop_reason && (
+          <div className="text-[11px] text-amber-600">
+            Early stop: {trace.early_stop_reason}
+          </div>
+        )}
       </div>
 
       {/* Timeline */}
@@ -99,32 +116,46 @@ export function TraceInspector({ trace, model, onClose }: TraceInspectorProps) {
 }
 
 function TrajectoryStateCard({ state }: { state: TrajectoryState }) {
+  const [expanded, setExpanded] = useState(state.round === 1);
+
   return (
     <div className="border rounded-md p-3 space-y-1 text-xs">
-      <div className="font-medium">Round #{state.round}</div>
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full flex items-center justify-between text-left"
+      >
+        <span className="font-medium">Round #{state.round}</span>
+        {expanded ? (
+          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+        )}
+      </button>
       <DetailRow label="Objective" value={state.objective} />
       <DetailRow label="Tool Calls" value={String(state.tool_calls)} />
-      <DetailRow
-        label="Evidence"
-        value={state.evidence.length > 0 ? state.evidence.join(" | ") : "n/a"}
-      />
-      <DetailRow
-        label="Uncertainties"
-        value={
-          state.uncertainties.length > 0
-            ? state.uncertainties.join(" | ")
-            : "n/a"
-        }
-      />
-      <DetailRow
-        label="Failures"
-        value={state.failures.length > 0 ? state.failures.join(" | ") : "n/a"}
-        isError={state.failures.length > 0}
-      />
-      <DetailRow
-        label="Next Plan"
-        value={state.next_plan.length > 0 ? state.next_plan.join(" | ") : "n/a"}
-      />
+      {expanded && (
+        <>
+          <DetailList
+            label="Evidence"
+            items={state.evidence}
+            emptyText="n/a"
+            itemClassName="text-emerald-600"
+          />
+          <DetailList
+            label="Uncertainties"
+            items={state.uncertainties}
+            emptyText="n/a"
+          />
+          <DetailList
+            label="Failures"
+            items={state.failures}
+            emptyText="n/a"
+            itemClassName="text-destructive"
+          />
+          <DetailList label="Next Plan" items={state.next_plan} emptyText="n/a" />
+        </>
+      )}
     </div>
   );
 }
@@ -224,8 +255,14 @@ function ToolStepDetail({ step }: { step: AgentStep }) {
       <DetailRow label="Duration" value={`${step.duration_ms}ms`} />
       <DetailRow
         label="Status"
-        value={step.success ? "Success" : "Failed"}
-        isError={!step.success}
+        value={
+          step.is_duplicate
+            ? "Skipped duplicate"
+            : step.success
+              ? "Success"
+              : "Failed"
+        }
+        isError={!step.success && !step.is_duplicate}
       />
       {step.arguments && Object.keys(step.arguments).length > 0 && (
         <div>
@@ -248,6 +285,38 @@ function ToolStepDetail({ step }: { step: AgentStep }) {
         </div>
       )}
     </>
+  );
+}
+
+function DetailList({
+  label,
+  items,
+  emptyText,
+  itemClassName,
+}: {
+  label: string;
+  items: string[];
+  emptyText: string;
+  itemClassName?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="text-[10px] text-muted-foreground">{label}</div>
+      {items.length === 0 ? (
+        <div className="text-xs text-muted-foreground">{emptyText}</div>
+      ) : (
+        <ul className="space-y-1">
+          {items.map((item, idx) => (
+            <li
+              key={`${label}-${idx}`}
+              className={`text-xs break-all font-mono ${itemClassName ?? ""}`}
+            >
+              - {item}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
