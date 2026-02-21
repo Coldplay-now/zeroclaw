@@ -451,6 +451,7 @@ strip = true          # 去除符号
 | 13 | `12-fork-upstream-sync-strategy.md` | 维护 fork 与 upstream 的安全同步策略 |
 | 14 | `13-retrac-for-zeroclaw.md` | RE-TRAC 方法解读与 ZeroClaw 落地方案 |
 | 15 | `eval/README.md` | RE-TRAC 引入前基线评测框架与执行方法 |
+| 16 | `14-retrac-phase-a-task-plan.md` | RE-TRAC-lite Phase A 任务计划与里程碑 |
 
 > 说明：学习文档会持续迭代，建议优先按本索引顺序阅读，后续再结合源码做深挖。
 
