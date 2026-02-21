@@ -332,6 +332,10 @@ pub struct AgentConfig {
     /// Cross-round deduplication window for equivalent tool calls (0 disables).
     #[serde(default = "default_agent_trajectory_tool_call_dedup_window")]
     pub trajectory_tool_call_dedup_window: usize,
+    /// Minimum tool-call rounds before trajectory compression activates (0 = always on).
+    /// Set to 2 to skip compression for short single-round tasks.
+    #[serde(default = "default_agent_trajectory_min_rounds")]
+    pub trajectory_min_rounds: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -366,6 +370,10 @@ fn default_agent_trajectory_tool_call_dedup_window() -> usize {
     3
 }
 
+fn default_agent_trajectory_min_rounds() -> usize {
+    2
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -380,6 +388,7 @@ impl Default for AgentConfig {
             trajectory_stop_on_redundant_rounds: default_agent_trajectory_stop_on_redundant_rounds(
             ),
             trajectory_tool_call_dedup_window: default_agent_trajectory_tool_call_dedup_window(),
+            trajectory_min_rounds: default_agent_trajectory_min_rounds(),
         }
     }
 }
@@ -3349,6 +3358,9 @@ impl Config {
         }
         if self.agent.trajectory_tool_call_dedup_window > 20 {
             anyhow::bail!("agent.trajectory_tool_call_dedup_window must be in range 0..=20");
+        }
+        if self.agent.trajectory_min_rounds > 10 {
+            anyhow::bail!("agent.trajectory_min_rounds must be in range 0..=10");
         }
 
         // Scheduler

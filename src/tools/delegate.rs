@@ -412,6 +412,7 @@ impl DelegateTool {
                 agent_config.max_iterations,
                 2,
                 3,
+                2,
                 None,
                 None,
             ),

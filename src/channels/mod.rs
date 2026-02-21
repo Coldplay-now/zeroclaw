@@ -1504,6 +1504,7 @@ async fn process_channel_message(
                 ctx.max_tool_iterations,
                 2,
                 3,
+                2,
                 Some(cancellation_token.clone()),
                 delta_tx,
             ),

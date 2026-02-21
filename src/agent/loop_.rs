@@ -32,6 +32,8 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 const DEFAULT_TRAJECTORY_STOP_ON_REDUNDANT_ROUNDS: usize = 2;
 /// Number of recent rounds to deduplicate equivalent tool calls against.
 const DEFAULT_TRAJECTORY_TOOL_CALL_DEDUP_WINDOW: usize = 3;
+/// Minimum tool-call rounds before trajectory compression activates.
+const DEFAULT_TRAJECTORY_MIN_ROUNDS: usize = 2;
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -1510,6 +1512,7 @@ pub(crate) async fn run_tool_call_loop(
         trajectory_max_rounds,
         DEFAULT_TRAJECTORY_STOP_ON_REDUNDANT_ROUNDS,
         DEFAULT_TRAJECTORY_TOOL_CALL_DEDUP_WINDOW,
+        DEFAULT_TRAJECTORY_MIN_ROUNDS,
         cancellation_token,
         on_delta,
     )
@@ -1555,6 +1558,7 @@ pub(crate) async fn run_tool_call_loop_with_trace(
         trajectory_max_rounds,
         DEFAULT_TRAJECTORY_STOP_ON_REDUNDANT_ROUNDS,
         DEFAULT_TRAJECTORY_TOOL_CALL_DEDUP_WINDOW,
+        DEFAULT_TRAJECTORY_MIN_ROUNDS,
         cancellation_token,
         on_delta,
     )
@@ -1580,6 +1584,7 @@ pub(crate) async fn run_tool_call_loop_with_policy(
     trajectory_max_rounds: usize,
     trajectory_stop_on_redundant_rounds: usize,
     trajectory_tool_call_dedup_window: usize,
+    trajectory_min_rounds: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
@@ -1601,6 +1606,7 @@ pub(crate) async fn run_tool_call_loop_with_policy(
         trajectory_max_rounds,
         trajectory_stop_on_redundant_rounds,
         trajectory_tool_call_dedup_window,
+        trajectory_min_rounds,
         cancellation_token,
         on_delta,
     )
@@ -1627,6 +1633,7 @@ pub(crate) async fn run_tool_call_loop_with_trace_and_policy(
     trajectory_max_rounds: usize,
     trajectory_stop_on_redundant_rounds: usize,
     trajectory_tool_call_dedup_window: usize,
+    trajectory_min_rounds: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<ToolLoopOutput> {
@@ -1652,6 +1659,7 @@ pub(crate) async fn run_tool_call_loop_with_trace_and_policy(
     let trajectory_state_max_items = trajectory_state_max_items.max(1);
     let dedup_window = trajectory_tool_call_dedup_window;
     let stop_threshold = trajectory_stop_on_redundant_rounds;
+    let min_rounds = trajectory_min_rounds;
 
     let tool_specs: Vec<crate::tools::ToolSpec> =
         tools_registry.iter().map(|tool| tool.spec()).collect();
@@ -1677,7 +1685,7 @@ pub(crate) async fn run_tool_call_loop_with_trace_and_policy(
             .into());
         }
 
-        let prepared_history: Vec<ChatMessage> = if trajectory_enabled {
+        let prepared_history: Vec<ChatMessage> = if trajectory_enabled && iteration >= min_rounds {
             if let Some(prev_state) = trajectory_states.last() {
                 let mut with_state = history.clone();
                 with_state.push(ChatMessage::system(trajectory_state_prompt_block(
@@ -1920,7 +1928,7 @@ pub(crate) async fn run_tool_call_loop_with_trace_and_policy(
         }
 
         let mut early_stop_reason: Option<String> = None;
-        if trajectory_enabled {
+        if trajectory_enabled && iteration >= min_rounds {
             let current_state = build_trajectory_state(
                 iteration + 1,
                 &objective,
@@ -2323,6 +2331,7 @@ pub async fn run(
             config.agent.trajectory_max_rounds,
             config.agent.trajectory_stop_on_redundant_rounds,
             config.agent.trajectory_tool_call_dedup_window,
+            config.agent.trajectory_min_rounds,
             None,
             None,
         )
@@ -2447,6 +2456,7 @@ pub async fn run(
                 config.agent.trajectory_max_rounds,
                 config.agent.trajectory_stop_on_redundant_rounds,
                 config.agent.trajectory_tool_call_dedup_window,
+                config.agent.trajectory_min_rounds,
                 None,
                 None,
             )
@@ -2683,6 +2693,7 @@ pub async fn process_message_with_trace(
         config.agent.trajectory_max_rounds,
         config.agent.trajectory_stop_on_redundant_rounds,
         config.agent.trajectory_tool_call_dedup_window,
+        config.agent.trajectory_min_rounds,
         None,
         None,
     )
@@ -3274,6 +3285,7 @@ mod tests {
             8,
             0,
             3,
+            0,
             None,
             None,
         )
@@ -3332,6 +3344,7 @@ mod tests {
             6,
             8,
             2,
+            0,
             0,
             None,
             None,
