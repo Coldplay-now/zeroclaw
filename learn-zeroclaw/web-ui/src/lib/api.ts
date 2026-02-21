@@ -462,7 +462,7 @@ export interface MetricsResponse {
 }
 
 export async function getMetrics(): Promise<MetricsResponse> {
-  return apiFetch("/metrics", {
+  return apiFetch("/dashboard/metrics", {
     headers: { ...authHeaders() },
   });
 }

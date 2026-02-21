@@ -9,12 +9,14 @@
 
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
+use crate::cron;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::tools;
+use crate::skills;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -22,11 +24,12 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{get, patch, post},
+    routing::{get, post},
     Router,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -288,6 +291,8 @@ pub struct AppState {
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    /// Tool registry for dashboard API
+    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
 }
@@ -350,7 +355,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -567,6 +572,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
+        tools_registry,
         observer,
     };
 
@@ -574,14 +580,49 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
-        .route("/config", get(handle_get_config))
-        .route("/config", patch(handle_patch_config))
+        .route("/config", get(handle_get_config).patch(handle_patch_config))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        // Management API (bearer token required)
+        .route("/status", get(handle_status))
+        .route("/dashboard/metrics", get(handle_dashboard_metrics))
+        .route("/prompts", get(handle_prompts_list))
+        .route("/prompts/preview", get(handle_prompts_preview))
+        .route(
+            "/prompts/{filename}",
+            get(handle_prompts_get).put(handle_prompts_put),
+        )
+        // Memory API (bearer token required)
+        .route("/memory", get(handle_memory_list).post(handle_memory_store))
+        .route("/memory/stats", get(handle_memory_stats))
+        .route("/memory/search", get(handle_memory_search))
+        .route(
+            "/memory/{key}",
+            get(handle_memory_get).delete(handle_memory_delete),
+        )
+        // Tools API (bearer token required)
+        .route("/tools", get(handle_tools_list))
+        .route("/tools/{name}", get(handle_tools_get))
+        // Cron API (bearer token required)
+        .route("/cron/jobs", get(handle_cron_list).post(handle_cron_create))
+        .route(
+            "/cron/jobs/{id}",
+            get(handle_cron_get)
+                .patch(handle_cron_update)
+                .delete(handle_cron_delete),
+        )
+        .route("/cron/jobs/{id}/runs", get(handle_cron_runs))
+        // Audit API (bearer token required)
+        .route("/audit/logs", get(handle_audit_logs))
+        // Skills API (bearer token required)
+        .route("/skills", get(handle_skills_list))
+        .route("/skills/{name}", get(handle_skills_get))
+        // Channels API (bearer token required)
+        .route("/channels", get(handle_channels_list))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1671,6 +1712,1118 @@ async fn handle_nextcloud_talk_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// STATUS API HANDLER
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /status — system status snapshot (bearer token required)
+async fn handle_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let health = crate::health::snapshot();
+    let config = state.config.lock();
+    let version = env!("CARGO_PKG_VERSION");
+
+    let components: serde_json::Value = health
+        .components
+        .iter()
+        .map(|(name, c)| {
+            (
+                name.clone(),
+                serde_json::json!({
+                    "status": c.status,
+                    "last_ok": c.last_ok,
+                    "last_error": c.last_error,
+                    "restart_count": c.restart_count,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into();
+
+    let ws = &config.workspace_dir;
+    let disk_free_mb = fs_free_mb(ws);
+    let workspace_info = serde_json::json!({
+        "path": ws.display().to_string(),
+        "disk_free_mb": disk_free_mb,
+    });
+
+    let body = serde_json::json!({
+        "version": version,
+        "uptime_seconds": health.uptime_seconds,
+        "pid": health.pid,
+        "provider": config.default_provider.as_deref().unwrap_or("unknown"),
+        "model": state.model,
+        "temperature": state.temperature,
+        "autonomy_level": format!("{:?}", config.autonomy.level).to_lowercase(),
+        "memory_backend": format!("{:?}", config.memory.backend).to_lowercase(),
+        "components": components,
+        "workspace": workspace_info,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+/// Best-effort available disk space in MB for the given path.
+fn fs_free_mb(path: &std::path::Path) -> Option<u64> {
+    let output = std::process::Command::new("df")
+        .arg("-k")
+        .arg(path)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().nth(1)?;
+    let available_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(available_kb / 1024)
+}
+
+/// GET /dashboard/metrics — aggregated metrics snapshot (JSON, for Web UI)
+async fn handle_dashboard_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let health = crate::health::snapshot();
+
+    // Memory stats
+    let memory_count = state.mem.count().await.unwrap_or(0);
+    let memory_healthy = state.mem.health_check().await;
+
+    // Tools count
+    let tools_count = state.tools_registry.len();
+
+    // Cron job stats
+    let config = state.config.lock();
+    let cron_stats = cron::list_jobs(&config).ok().map(|jobs| {
+        let total = jobs.len();
+        let active = jobs.iter().filter(|j| j.enabled).count();
+        serde_json::json!({
+            "total": total,
+            "active": active,
+            "paused": total - active,
+        })
+    });
+    drop(config);
+
+    // Component health summary
+    let mut components_ok = 0usize;
+    let mut components_error = 0usize;
+    let mut total_restarts = 0u64;
+    for comp in health.components.values() {
+        if comp.status == "ok" {
+            components_ok += 1;
+        } else {
+            components_error += 1;
+        }
+        total_restarts += comp.restart_count;
+    }
+
+    let body = serde_json::json!({
+        "uptime_seconds": health.uptime_seconds,
+        "pid": health.pid,
+        "observer": state.observer.name(),
+        "components": {
+            "ok": components_ok,
+            "error": components_error,
+            "total": health.components.len(),
+            "total_restarts": total_restarts,
+        },
+        "memory": {
+            "backend": state.mem.name(),
+            "count": memory_count,
+            "healthy": memory_healthy,
+        },
+        "tools": {
+            "registered": tools_count,
+        },
+        "cron": cron_stats,
+        "hint": "For time-series metrics, configure observability.backend = \"otel\" with an external collector.",
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROMPTS API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Allowed workspace prompt filenames (whitelist).
+const PROMPT_FILES: &[&str] = &[
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "MEMORY.md",
+];
+
+/// Assembly order matches `src/agent/prompt.rs` IdentitySection::build().
+const PROMPT_ASSEMBLY_ORDER: &[&str] = &[
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "MEMORY.md",
+];
+
+/// Role descriptions for each prompt file.
+fn prompt_file_role(filename: &str) -> &'static str {
+    match filename {
+        "AGENTS.md" => "Session bootstrap instructions",
+        "SOUL.md" => "Core personality and values",
+        "TOOLS.md" => "Tool usage guidance",
+        "IDENTITY.md" => "Agent identity definition",
+        "USER.md" => "User profile and preferences",
+        "HEARTBEAT.md" => "Periodic heartbeat tasks",
+        "BOOTSTRAP.md" => "Custom bootstrap instructions",
+        "MEMORY.md" => "Long-term memory (agent-managed)",
+        _ => "Unknown",
+    }
+}
+
+/// GET /prompts — list all prompt files with metadata
+async fn handle_prompts_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let ws = config.workspace_dir.clone();
+    drop(config);
+
+    let mut files = Vec::new();
+    for &filename in PROMPT_ASSEMBLY_ORDER {
+        let path = ws.join(filename);
+        let (exists, chars, bytes, updated) = match std::fs::metadata(&path) {
+            Ok(meta) => {
+                let bytes = meta.len();
+                let chars = std::fs::read_to_string(&path)
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0);
+                let updated = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                (true, chars, bytes, updated)
+            }
+            Err(_) => (false, 0, 0, None),
+        };
+
+        files.push(serde_json::json!({
+            "filename": filename,
+            "exists": exists,
+            "role": prompt_file_role(filename),
+            "chars": chars,
+            "bytes": bytes,
+            "updated_epoch": updated,
+        }));
+    }
+
+    let total_chars: u64 = files.iter().filter_map(|f| f["chars"].as_u64()).sum();
+
+    let body = serde_json::json!({
+        "files": files,
+        "total_chars": total_chars,
+        "max_chars_per_file": 20_000,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+/// GET /prompts/:filename — return a single file's full content
+async fn handle_prompts_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    if !PROMPT_FILES.contains(&filename.as_str()) {
+        let err = serde_json::json!({
+            "error": format!("File not allowed: {filename}"),
+            "allowed": PROMPT_FILES,
+        });
+        return (StatusCode::FORBIDDEN, Json(err));
+    }
+
+    let config = state.config.lock();
+    let path = config.workspace_dir.join(&filename);
+    drop(config);
+
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let body = serde_json::json!({
+                "filename": filename,
+                "content": content,
+                "chars": content.chars().count(),
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let body = serde_json::json!({
+                "filename": filename,
+                "content": null,
+                "chars": 0,
+                "exists": false,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to read {filename}: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// Request body for PUT /prompts/:filename
+#[derive(serde::Deserialize)]
+struct PromptsUpdateBody {
+    content: String,
+}
+
+/// PUT /prompts/:filename — overwrite a prompt file
+async fn handle_prompts_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+    body: Result<Json<PromptsUpdateBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    if !PROMPT_FILES.contains(&filename.as_str()) {
+        let err = serde_json::json!({
+            "error": format!("File not allowed: {filename}"),
+            "allowed": PROMPT_FILES,
+        });
+        return (StatusCode::FORBIDDEN, Json(err));
+    }
+
+    let Json(update) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Invalid JSON body: {e}. Expected: {{\"content\": \"...\"}}")});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let char_count = update.content.chars().count();
+    if char_count > 20_000 {
+        let err = serde_json::json!({
+            "error": format!("Content exceeds 20,000 character limit ({char_count} chars)"),
+            "chars": char_count,
+            "max_chars": 20_000,
+        });
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
+
+    let config = state.config.lock();
+    let path = config.workspace_dir.join(&filename);
+    drop(config);
+
+    match std::fs::write(&path, &update.content) {
+        Ok(()) => {
+            tracing::info!("Prompt file updated via API: {filename} ({char_count} chars)");
+            let body = serde_json::json!({
+                "filename": filename,
+                "chars": char_count,
+                "saved": true,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to write {filename}: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// GET /prompts/preview — assemble all prompt files in order, return merged text
+async fn handle_prompts_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let ws = config.workspace_dir.clone();
+    drop(config);
+
+    let mut assembled = String::new();
+    for &filename in PROMPT_ASSEMBLY_ORDER {
+        let path = ws.join(filename);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if !assembled.is_empty() {
+                assembled.push_str("\n\n");
+            }
+            let _ = writeln!(assembled, "--- {filename} ---");
+            if content.chars().count() > 20_000 {
+                let truncated: String = content.chars().take(20_000).collect();
+                assembled.push_str(&truncated);
+                assembled.push_str("\n[... truncated at 20,000 chars]");
+            } else {
+                assembled.push_str(&content);
+            }
+        }
+    }
+
+    let body = serde_json::json!({
+        "preview": assembled,
+        "chars": assembled.chars().count(),
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MEMORY API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[derive(serde::Deserialize)]
+struct MemoryListQuery {
+    category: Option<String>,
+    session_id: Option<String>,
+}
+
+/// GET /memory — list memory entries
+async fn handle_memory_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<MemoryListQuery>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let category = query.category.as_deref().map(|c| match c {
+        "core" => MemoryCategory::Core,
+        "daily" => MemoryCategory::Daily,
+        "conversation" => MemoryCategory::Conversation,
+        other => MemoryCategory::Custom(other.to_string()),
+    });
+
+    match state
+        .mem
+        .list(category.as_ref(), query.session_id.as_deref())
+        .await
+    {
+        Ok(entries) => {
+            let count = entries.len();
+            let body = serde_json::json!({
+                "entries": entries,
+                "count": count,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to list memory: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MemoryStoreBody {
+    key: String,
+    content: String,
+    category: Option<String>,
+    session_id: Option<String>,
+}
+
+/// POST /memory — store a memory entry
+async fn handle_memory_store(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<MemoryStoreBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let Json(data) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Invalid JSON: {e}")});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let category = match data.category.as_deref() {
+        Some("core") => MemoryCategory::Core,
+        Some("daily") => MemoryCategory::Daily,
+        Some("conversation") => MemoryCategory::Conversation,
+        Some(other) => MemoryCategory::Custom(other.to_string()),
+        None => MemoryCategory::Custom("api".to_string()),
+    };
+
+    match state
+        .mem
+        .store(
+            &data.key,
+            &data.content,
+            category,
+            data.session_id.as_deref(),
+        )
+        .await
+    {
+        Ok(()) => {
+            let body = serde_json::json!({"stored": true, "key": data.key});
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to store memory: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// GET /memory/stats — memory backend stats
+async fn handle_memory_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let count = state.mem.count().await.unwrap_or(0);
+    let healthy = state.mem.health_check().await;
+
+    let body = serde_json::json!({
+        "backend": state.mem.name(),
+        "count": count,
+        "healthy": healthy,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+#[derive(serde::Deserialize)]
+struct MemorySearchQuery {
+    q: String,
+    limit: Option<usize>,
+    session_id: Option<String>,
+}
+
+/// GET /memory/search — recall/search memory entries
+async fn handle_memory_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<MemorySearchQuery>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let limit = query.limit.unwrap_or(10).min(50);
+
+    match state
+        .mem
+        .recall(&query.q, limit, query.session_id.as_deref())
+        .await
+    {
+        Ok(entries) => {
+            let count = entries.len();
+            let body = serde_json::json!({
+                "entries": entries,
+                "count": count,
+                "query": query.q,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Memory search failed: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// GET /memory/{key} — get a single memory entry
+async fn handle_memory_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    match state.mem.get(&key).await {
+        Ok(Some(entry)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(entry).unwrap_or_default()),
+        ),
+        Ok(None) => {
+            let err = serde_json::json!({"error": format!("Memory key not found: {key}")});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to get memory: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// DELETE /memory/{key} — forget a memory entry
+async fn handle_memory_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    match state.mem.forget(&key).await {
+        Ok(true) => {
+            let body = serde_json::json!({"deleted": true, "key": key});
+            (StatusCode::OK, Json(body))
+        }
+        Ok(false) => {
+            let err = serde_json::json!({"error": format!("Memory key not found: {key}")});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to delete memory: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TOOLS API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /tools — list all registered tools
+async fn handle_tools_list(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let tools: Vec<serde_json::Value> = state
+        .tools_registry
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name(),
+                "description": t.description(),
+            })
+        })
+        .collect();
+
+    let count = tools.len();
+    let body = serde_json::json!({
+        "tools": tools,
+        "count": count,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+/// GET /tools/{name} — get a single tool's full spec
+async fn handle_tools_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    match state.tools_registry.iter().find(|t| t.name() == name) {
+        Some(tool) => {
+            let spec = tool.spec();
+            let body = serde_json::json!({
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        None => {
+            let err = serde_json::json!({"error": format!("Tool not found: {name}")});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CRON API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /cron/jobs — list all cron jobs
+async fn handle_cron_list(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let result = cron::list_jobs(&config);
+    drop(config);
+
+    match result {
+        Ok(jobs) => {
+            let count = jobs.len();
+            let body = serde_json::json!({
+                "jobs": jobs,
+                "count": count,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to list cron jobs: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CronCreateBody {
+    schedule: cron::Schedule,
+    #[serde(default)]
+    job_type: cron::JobType,
+    command: Option<String>,
+    prompt: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    session_target: cron::SessionTarget,
+    model: Option<String>,
+    delivery: Option<cron::DeliveryConfig>,
+    #[serde(default)]
+    delete_after_run: bool,
+}
+
+/// POST /cron/jobs — create a new cron job
+async fn handle_cron_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<CronCreateBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let Json(data) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Invalid JSON: {e}")});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let config = state.config.lock();
+    let result = match data.job_type {
+        cron::JobType::Shell => {
+            let Some(ref cmd) = data.command else {
+                drop(config);
+                let err = serde_json::json!({"error": "Shell job requires 'command' field"});
+                return (StatusCode::BAD_REQUEST, Json(err));
+            };
+            cron::add_shell_job(&config, data.name.clone(), data.schedule.clone(), cmd)
+        }
+        cron::JobType::Agent => {
+            let Some(ref prompt) = data.prompt else {
+                drop(config);
+                let err = serde_json::json!({"error": "Agent job requires 'prompt' field"});
+                return (StatusCode::BAD_REQUEST, Json(err));
+            };
+            cron::add_agent_job(
+                &config,
+                data.name.clone(),
+                data.schedule.clone(),
+                prompt,
+                data.session_target.clone(),
+                data.model.clone(),
+                data.delivery.clone(),
+                data.delete_after_run,
+            )
+        }
+    };
+    drop(config);
+
+    match result {
+        Ok(job) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(job).unwrap_or_default()),
+        ),
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to create cron job: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// GET /cron/jobs/{id} — get a single cron job
+async fn handle_cron_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let result = cron::get_job(&config, &id);
+    drop(config);
+
+    match result {
+        Ok(job) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(job).unwrap_or_default()),
+        ),
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Cron job not found: {e}")});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+    }
+}
+
+/// PATCH /cron/jobs/{id} — update a cron job
+async fn handle_cron_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Result<Json<cron::CronJobPatch>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let Json(patch) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Invalid JSON: {e}")});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let config = state.config.lock();
+    let result = cron::update_job(&config, &id, patch);
+    drop(config);
+
+    match result {
+        Ok(job) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(job).unwrap_or_default()),
+        ),
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to update cron job: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// DELETE /cron/jobs/{id} — delete a cron job
+async fn handle_cron_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let result = cron::remove_job(&config, &id);
+    drop(config);
+
+    match result {
+        Ok(()) => {
+            let body = serde_json::json!({"deleted": true, "id": id});
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to delete cron job: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CronRunsQuery {
+    limit: Option<usize>,
+}
+
+/// GET /cron/jobs/{id}/runs — list recent runs for a cron job
+async fn handle_cron_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<CronRunsQuery>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let limit = query.limit.unwrap_or(20).min(100);
+
+    let config = state.config.lock();
+    let result = cron::list_runs(&config, &id, limit);
+    drop(config);
+
+    match result {
+        Ok(runs) => {
+            let count = runs.len();
+            let body = serde_json::json!({
+                "runs": runs,
+                "count": count,
+                "job_id": id,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to list cron runs: {e}")});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AUDIT API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[derive(serde::Deserialize)]
+struct AuditLogsQuery {
+    /// Filter by event type (e.g. "command_execution", "policy_violation")
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    /// Maximum number of entries to return (default 100, max 500)
+    limit: Option<usize>,
+    /// Number of entries to skip (for pagination)
+    offset: Option<usize>,
+}
+
+/// GET /audit/logs — return recent audit log entries from the JSONL audit file
+async fn handle_audit_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditLogsQuery>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let audit_log_path = config
+        .config_path
+        .parent()
+        .map(|p| p.join("audit.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("audit.log"));
+    drop(config);
+
+    // Read the JSONL audit log file
+    let content = match std::fs::read_to_string(&audit_log_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let body = serde_json::json!({
+                "entries": [],
+                "count": 0,
+                "total": 0,
+                "enabled": true,
+                "message": "No audit log entries yet",
+            });
+            return (StatusCode::OK, Json(body));
+        }
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to read audit log: {e}")});
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+        }
+    };
+
+    // Parse JSONL lines into audit events, newest first
+    let mut entries: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    entries.reverse();
+
+    // Apply type filter
+    if let Some(ref event_type) = query.event_type {
+        entries.retain(|e| {
+            e.get("event_type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t == event_type.as_str())
+        });
+    }
+
+    let total = entries.len();
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).min(500);
+
+    let page: Vec<serde_json::Value> = entries.into_iter().skip(offset).take(limit).collect();
+    let count = page.len();
+
+    let body = serde_json::json!({
+        "entries": page,
+        "count": count,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "enabled": true,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SKILLS API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /skills — list all installed skills
+async fn handle_skills_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let workspace_dir = config.workspace_dir.clone();
+    drop(config);
+
+    let all_skills = skills::load_skills(&workspace_dir);
+    let skills_json: Vec<serde_json::Value> = all_skills
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "version": s.version,
+                "author": s.author,
+                "tags": s.tags,
+                "tools_count": s.tools.len(),
+                "prompts_count": s.prompts.len(),
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "skills": skills_json,
+        "count": all_skills.len(),
+    });
+    (StatusCode::OK, Json(body))
+}
+
+/// GET /skills/{name} — get skill detail
+async fn handle_skills_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let workspace_dir = config.workspace_dir.clone();
+    drop(config);
+
+    let all_skills = skills::load_skills(&workspace_dir);
+    match all_skills.into_iter().find(|s| s.name == name) {
+        Some(skill) => {
+            let body = serde_json::json!({
+                "name": skill.name,
+                "description": skill.description,
+                "version": skill.version,
+                "author": skill.author,
+                "tags": skill.tags,
+                "tools": skill.tools,
+                "prompts": skill.prompts,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        None => {
+            let err = serde_json::json!({"error": format!("Skill '{}' not found", name)});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CHANNELS API HANDLER
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /channels — list configured channels with health status
+async fn handle_channels_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(resp) = require_pairing_auth(&state, &headers) {
+        return resp;
+    }
+
+    let config = state.config.lock();
+    let health = crate::health::snapshot();
+
+    let mut channels = Vec::new();
+
+    let channel_checks: Vec<(&str, bool)> = vec![
+        ("cli", config.channels_config.cli),
+        ("telegram", config.channels_config.telegram.is_some()),
+        ("discord", config.channels_config.discord.is_some()),
+        ("slack", config.channels_config.slack.is_some()),
+        ("mattermost", config.channels_config.mattermost.is_some()),
+        ("webhook", config.channels_config.webhook.is_some()),
+        ("imessage", config.channels_config.imessage.is_some()),
+        ("matrix", config.channels_config.matrix.is_some()),
+        ("signal", config.channels_config.signal.is_some()),
+        ("whatsapp", config.channels_config.whatsapp.is_some()),
+        ("email", config.channels_config.email.is_some()),
+        ("irc", config.channels_config.irc.is_some()),
+        ("lark", config.channels_config.lark.is_some()),
+        ("dingtalk", config.channels_config.dingtalk.is_some()),
+        ("qq", config.channels_config.qq.is_some()),
+        ("linq", config.channels_config.linq.is_some()),
+        (
+            "nextcloud_talk",
+            config.channels_config.nextcloud_talk.is_some(),
+        ),
+    ];
+    drop(config);
+
+    for (name, configured) in &channel_checks {
+        let comp_health = health.components.get(*name);
+        channels.push(serde_json::json!({
+            "name": name,
+            "configured": configured,
+            "status": comp_health.map(|c| c.status.as_str()).unwrap_or("unknown"),
+            "restart_count": comp_health.map(|c| c.restart_count).unwrap_or(0),
+            "last_ok": comp_health.and_then(|c| c.last_ok.as_deref()),
+            "last_error": comp_health.and_then(|c| c.last_error.as_deref()),
+        }));
+    }
+
+    let configured_count = channel_checks.iter().filter(|(_, c)| *c).count();
+    let body = serde_json::json!({
+        "channels": channels,
+        "total": channel_checks.len(),
+        "configured": configured_count,
+    });
+    (StatusCode::OK, Json(body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1748,6 +2901,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1793,6 +2947,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            tools_registry: Arc::new(vec![]),
             observer,
         };
 
@@ -2155,6 +3310,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -2215,6 +3371,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -2287,6 +3444,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -2331,6 +3489,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -2380,6 +3539,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -2434,6 +3594,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -2484,6 +3645,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            tools_registry: Arc::new(vec![]),
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
