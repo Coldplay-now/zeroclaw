@@ -32,3 +32,4 @@ credentials.json
 learn-zeroclaw/workspace/daemon_state.json
 learn-zeroclaw/workspace/.run/
 learn-zeroclaw/workspace/workspace/
+learn-zeroclaw/workspace/config.toml
