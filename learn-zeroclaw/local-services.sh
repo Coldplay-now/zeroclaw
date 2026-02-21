@@ -12,6 +12,7 @@ BACKEND_PID_FILE="${RUN_DIR}/backend.pid"
 FRONTEND_PID_FILE="${RUN_DIR}/frontend.pid"
 BACKEND_LOG="${RUN_DIR}/backend.log"
 FRONTEND_LOG="${RUN_DIR}/frontend.log"
+BACKEND_MODE="debug"
 
 mkdir -p "${RUN_DIR}"
 
@@ -47,7 +48,14 @@ start_backend() {
     exit 1
   fi
 
-  echo "启动后端网关..."
+  local daemon_cmd
+  if [[ "${BACKEND_MODE}" == "release" ]]; then
+    daemon_cmd="target/release/zeroclaw daemon --host 127.0.0.1 --port 3000"
+  else
+    daemon_cmd="cargo run -- daemon --host 127.0.0.1 --port 3000"
+  fi
+
+  echo "启动后端网关... (mode: ${BACKEND_MODE})"
   nohup bash -lc "
     set -euo pipefail
     if [[ -f \"${ENV_FILE}\" ]]; then
@@ -56,7 +64,7 @@ start_backend() {
       set +a
     fi
     cd \"${REPO_ROOT}\"
-    ZEROCLAW_WORKSPACE=\"${WORKSPACE_DIR}\" cargo run -- daemon --host 127.0.0.1 --port 3000
+    ZEROCLAW_WORKSPACE=\"${WORKSPACE_DIR}\" ${daemon_cmd}
   " >"${BACKEND_LOG}" 2>&1 &
   echo $! >"${BACKEND_PID_FILE}"
   sleep 1
@@ -125,7 +133,20 @@ status_one() {
   local pid
   pid="$(read_pid "${pid_file}" || true)"
   if [[ -n "${pid}" ]] && is_running "${pid}"; then
-    echo "${name}: 运行中 (PID: ${pid})"
+    if [[ "${name}" == "后端" ]]; then
+      local cmdline mode
+      cmdline="$(ps -o command= -p "${pid}" 2>/dev/null || true)"
+      if [[ "${cmdline}" == *"target/release/zeroclaw"* ]]; then
+        mode="release"
+      elif [[ "${cmdline}" == *"target/debug/zeroclaw"* ]] || [[ "${cmdline}" == *"cargo run -- daemon"* ]]; then
+        mode="debug"
+      else
+        mode="unknown"
+      fi
+      echo "${name}: 运行中 (PID: ${pid}, mode: ${mode})"
+    else
+      echo "${name}: 运行中 (PID: ${pid})"
+    fi
   else
     echo "${name}: 未运行"
   fi
@@ -147,6 +168,18 @@ show_logs() {
   fi
 }
 
+check_health() {
+  local name="$1"
+  local url="$2"
+  local body
+  if body="$(curl -fsS -m 3 "${url}" 2>/dev/null)"; then
+    echo "${name}健康: OK (${url})"
+    echo "  响应: ${body}"
+  else
+    echo "${name}健康: FAIL (${url})"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 用法:
@@ -155,10 +188,34 @@ usage() {
   bash learn-zeroclaw/local-services.sh restart
   bash learn-zeroclaw/local-services.sh status
   bash learn-zeroclaw/local-services.sh logs
+
+可选参数（用于 start/restart）:
+  --release   后端使用 release 二进制启动（更省资源）
+  --debug     后端使用 cargo run 启动（默认）
+
+示例:
+  bash learn-zeroclaw/local-services.sh start --release
+  bash learn-zeroclaw/local-services.sh restart --release
 EOF
 }
 
 cmd="${1:-status}"
+if [[ $# -ge 2 ]]; then
+  case "${2}" in
+    --release)
+      BACKEND_MODE="release"
+      ;;
+    --debug)
+      BACKEND_MODE="debug"
+      ;;
+    *)
+      echo "未知参数: ${2}"
+      usage
+      exit 1
+      ;;
+  esac
+fi
+
 case "${cmd}" in
   start)
     start_backend
@@ -177,6 +234,8 @@ case "${cmd}" in
   status)
     status_one "后端" "${BACKEND_PID_FILE}"
     status_one "前端" "${FRONTEND_PID_FILE}"
+    check_health "后端" "http://127.0.0.1:3000/health"
+    check_health "前端代理" "http://127.0.0.1:5173/api/health"
     ;;
   logs)
     show_logs

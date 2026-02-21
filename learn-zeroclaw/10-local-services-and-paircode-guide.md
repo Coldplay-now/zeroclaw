@@ -15,6 +15,12 @@
 bash learn-zeroclaw/local-services.sh start
 ```
 
+如需后端使用更省资源的 `release` 模式：
+
+```bash
+bash learn-zeroclaw/local-services.sh start --release
+```
+
 常用命令：
 
 ```bash
@@ -27,6 +33,9 @@ bash learn-zeroclaw/local-services.sh logs
 # 重启
 bash learn-zeroclaw/local-services.sh restart
 
+# 以 release 模式重启后端（前端不变）
+bash learn-zeroclaw/local-services.sh restart --release
+
 # 停止
 bash learn-zeroclaw/local-services.sh stop
 ```
@@ -36,6 +45,8 @@ bash learn-zeroclaw/local-services.sh stop
 - 后端默认地址：`http://127.0.0.1:3000`
 - 前端默认地址：`http://localhost:5173`
 - 脚本会在 `learn-zeroclaw/workspace/.run/` 下维护 PID 和日志文件
+- 后端默认 `debug` 模式；传 `--release` 时改用 `target/release/zeroclaw`
+- `status` 会显示后端当前模式（`debug` / `release` / `unknown`），并检查后端 `/health` 与前端代理 `/api/health`
 
 ## 3. 一键系统诊断
 

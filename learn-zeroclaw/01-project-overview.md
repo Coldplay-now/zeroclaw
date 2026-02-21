@@ -446,6 +446,9 @@ strip = true          # 去除符号
 | 08 | `03-web-dashboard-prd.md` | 结合产品侧需求看落地目标 |
 | 09 | `04-web-dashboard-tasks.md` | 对照任务拆解进入实操 |
 | 10 | `05-web-dashboard-changelog.md` | 跟踪迭代记录与变更背景 |
+| 11 | `10-local-services-and-paircode-guide.md` | 本地长驻运行、诊断与 Pair Code 实操 |
+| 12 | `11-skills-vs-tools-guide.md` | 区分 Skill 与 Tool 的职责边界 |
+| 13 | `12-fork-upstream-sync-strategy.md` | 维护 fork 与 upstream 的安全同步策略 |
 
 > 说明：学习文档会持续迭代，建议优先按本索引顺序阅读，后续再结合源码做深挖。
 
