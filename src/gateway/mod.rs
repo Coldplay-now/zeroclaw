@@ -10,7 +10,7 @@
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
+use crate::providers::{self, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
@@ -704,7 +704,10 @@ async fn handle_get_config(
         "agent": {
             "max_tool_iterations": cfg.agent.max_tool_iterations,
             "max_history_messages": cfg.agent.max_history_messages,
-            "parallel_tools": cfg.agent.parallel_tools
+            "parallel_tools": cfg.agent.parallel_tools,
+            "trajectory_compression_enabled": cfg.agent.trajectory_compression_enabled,
+            "trajectory_state_max_items": cfg.agent.trajectory_state_max_items,
+            "trajectory_max_rounds": cfg.agent.trajectory_max_rounds
         },
         "channels_config": {
             "message_timeout_secs": cfg.channels_config.message_timeout_secs
@@ -820,6 +823,29 @@ async fn handle_patch_config(
                 .filter(|v| (10..=200).contains(v))
                 .map(|v| {
                     cfg.agent.max_history_messages = v as usize;
+                    true
+                })
+                .unwrap_or(false),
+            "agent_trajectory_compression_enabled" => value
+                .as_bool()
+                .map(|v| {
+                    cfg.agent.trajectory_compression_enabled = v;
+                    true
+                })
+                .unwrap_or(false),
+            "agent_trajectory_state_max_items" => value
+                .as_u64()
+                .filter(|v| (1..=20).contains(v))
+                .map(|v| {
+                    cfg.agent.trajectory_state_max_items = v as usize;
+                    true
+                })
+                .unwrap_or(false),
+            "agent_trajectory_max_rounds" => value
+                .as_u64()
+                .filter(|v| (1..=50).contains(v))
+                .map(|v| {
+                    cfg.agent.trajectory_max_rounds = v as usize;
                     true
                 })
                 .unwrap_or(false),
@@ -1019,50 +1045,22 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
+async fn run_gateway_chat_with_trace(
+    state: &AppState,
+    _provider_label: &str,
+    message: &str,
+) -> anyhow::Result<crate::agent::loop_::ProcessMessageOutput> {
+    let cfg = state.config.lock().clone();
+    crate::agent::loop_::process_message_with_trace(cfg, message).await
+}
+
 async fn run_gateway_chat_with_multimodal(
     state: &AppState,
     provider_label: &str,
     message: &str,
 ) -> anyhow::Result<String> {
-    let user_messages = vec![ChatMessage::user(message)];
-    let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
-    if image_marker_count > 0 && !state.provider.supports_vision() {
-        return Err(ProviderCapabilityError {
-            provider: provider_label.to_string(),
-            capability: "vision".to_string(),
-            message: format!(
-                "received {image_marker_count} image marker(s), but this provider does not support vision input"
-            ),
-        }
-        .into());
-    }
-
-    // Keep webhook/gateway prompts aligned with channel behavior by injecting
-    // workspace-aware system context before model invocation.
-    let system_prompt = {
-        let config_guard = state.config.lock();
-        crate::channels::build_system_prompt(
-            &config_guard.workspace_dir,
-            &state.model,
-            &[], // tools - empty for simple chat
-            &[], // skills
-            Some(&config_guard.identity),
-            None, // bootstrap_max_chars - use default
-        )
-    };
-
-    let mut messages = Vec::with_capacity(1 + user_messages.len());
-    messages.push(ChatMessage::system(system_prompt));
-    messages.extend(user_messages);
-
-    let multimodal_config = state.config.lock().multimodal.clone();
-    let prepared =
-        crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
-
-    state
-        .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
-        .await
+    let output = run_gateway_chat_with_trace(state, provider_label, message).await?;
+    Ok(output.response)
 }
 
 /// Webhook request body
@@ -1186,8 +1184,8 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
-        Ok(response) => {
+    match run_gateway_chat_with_trace(&state, &provider_label, message).await {
+        Ok(output) => {
             let duration = started_at.elapsed();
             state
                 .observer
@@ -1211,7 +1209,24 @@ async fn handle_webhook(
                     cost_usd: None,
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let tool_calls: Vec<String> = output
+                .trace
+                .steps
+                .iter()
+                .filter_map(|step| match step {
+                    crate::agent::loop_::AgentStepTrace::ToolCall { tool, .. } => {
+                        Some(tool.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let body = serde_json::json!({
+                "response": output.response,
+                "model": state.model,
+                "duration_ms": duration.as_millis(),
+                "tool_calls": tool_calls,
+                "trace": output.trace,
+            });
             (StatusCode::OK, Json(body))
         }
         Err(e) => {

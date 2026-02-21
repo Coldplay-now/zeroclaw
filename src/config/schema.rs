@@ -317,6 +317,15 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Enable RE-TRAC-lite trajectory compression in tool loop.
+    #[serde(default = "default_agent_trajectory_compression_enabled")]
+    pub trajectory_compression_enabled: bool,
+    /// Maximum items per trajectory state section (evidence/failures/etc).
+    #[serde(default = "default_agent_trajectory_state_max_items")]
+    pub trajectory_state_max_items: usize,
+    /// Maximum trajectory rounds for a single message.
+    #[serde(default = "default_agent_trajectory_max_rounds")]
+    pub trajectory_max_rounds: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -331,6 +340,18 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_agent_trajectory_compression_enabled() -> bool {
+    true
+}
+
+fn default_agent_trajectory_state_max_items() -> usize {
+    6
+}
+
+fn default_agent_trajectory_max_rounds() -> usize {
+    8
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -339,6 +360,9 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            trajectory_compression_enabled: default_agent_trajectory_compression_enabled(),
+            trajectory_state_max_items: default_agent_trajectory_state_max_items(),
+            trajectory_max_rounds: default_agent_trajectory_max_rounds(),
         }
     }
 }
@@ -3288,6 +3312,20 @@ impl Config {
         // Autonomy
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
+        }
+
+        // Agent
+        if self.agent.max_tool_iterations == 0 {
+            anyhow::bail!("agent.max_tool_iterations must be greater than 0");
+        }
+        if self.agent.max_history_messages == 0 {
+            anyhow::bail!("agent.max_history_messages must be greater than 0");
+        }
+        if !(1..=20).contains(&self.agent.trajectory_state_max_items) {
+            anyhow::bail!("agent.trajectory_state_max_items must be in range 1..=20");
+        }
+        if !(1..=50).contains(&self.agent.trajectory_max_rounds) {
+            anyhow::bail!("agent.trajectory_max_rounds must be in range 1..=50");
         }
 
         // Scheduler

@@ -60,6 +60,9 @@ python3 learn-zeroclaw/eval/scripts/run_baseline.py \
   --repeats 3
 ```
 
+> `baseline_tasks.jsonl` 为开发期 5 条 smoke 集；  
+> 完整对比请使用 `baseline_tasks_full.jsonl`（20 条）。
+
 4) 生成汇总：
 
 ```bash

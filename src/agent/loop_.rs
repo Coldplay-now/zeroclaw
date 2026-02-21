@@ -945,6 +945,173 @@ struct ParsedToolCall {
     arguments: serde_json::Value,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrajectoryState {
+    pub round: usize,
+    pub objective: String,
+    pub evidence: Vec<String>,
+    pub uncertainties: Vec<String>,
+    pub failures: Vec<String>,
+    pub next_plan: Vec<String>,
+    pub tool_calls: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum AgentStepTrace {
+    LlmRequest {
+        provider: String,
+        model: String,
+        messages_count: usize,
+        duration_ms: u128,
+        success: bool,
+        error: Option<String>,
+        response_preview: Option<String>,
+    },
+    ToolCall {
+        tool: String,
+        arguments: serde_json::Value,
+        output_preview: String,
+        duration_ms: u128,
+        success: bool,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentTrace {
+    pub steps: Vec<AgentStepTrace>,
+    pub total_duration_ms: u128,
+    pub iterations: usize,
+    pub trajectory_states: Vec<TrajectoryState>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolLoopOutput {
+    pub response: String,
+    pub trace: AgentTrace,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProcessMessageOutput {
+    pub response: String,
+    pub trace: AgentTrace,
+}
+
+#[derive(Debug, Clone)]
+struct ToolExecutionRecord {
+    output: String,
+    duration_ms: u128,
+    success: bool,
+    error: Option<String>,
+}
+
+fn extract_objective(history: &[ChatMessage]) -> String {
+    history
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| truncate_with_ellipsis(&m.content, 200))
+        .unwrap_or_else(|| "User request".to_string())
+}
+
+fn trajectory_state_prompt_block(state: &TrajectoryState) -> String {
+    let mut block = String::new();
+    let _ = writeln!(block, "## Trajectory State (Round {})", state.round);
+    let _ = writeln!(block, "Objective: {}", state.objective);
+    let _ = writeln!(block, "Tool calls this round: {}", state.tool_calls);
+    if !state.evidence.is_empty() {
+        block.push_str("Evidence:\n");
+        for item in &state.evidence {
+            let _ = writeln!(block, "- {item}");
+        }
+    }
+    if !state.uncertainties.is_empty() {
+        block.push_str("Uncertainties:\n");
+        for item in &state.uncertainties {
+            let _ = writeln!(block, "- {item}");
+        }
+    }
+    if !state.failures.is_empty() {
+        block.push_str("Failures:\n");
+        for item in &state.failures {
+            let _ = writeln!(block, "- {item}");
+        }
+    }
+    if !state.next_plan.is_empty() {
+        block.push_str("Next plan:\n");
+        for item in &state.next_plan {
+            let _ = writeln!(block, "- {item}");
+        }
+    }
+    block
+}
+
+fn build_trajectory_state(
+    round: usize,
+    objective: &str,
+    llm_text: &str,
+    tool_calls: &[ParsedToolCall],
+    tool_results: &[ToolExecutionRecord],
+    max_items: usize,
+) -> TrajectoryState {
+    let mut evidence = Vec::new();
+    let mut failures = Vec::new();
+
+    for (call, result) in tool_calls.iter().zip(tool_results.iter()) {
+        let item = format!(
+            "{} => {}",
+            call.name,
+            truncate_with_ellipsis(&result.output, 180)
+        );
+        if result.success {
+            evidence.push(item);
+        } else {
+            failures.push(item);
+        }
+    }
+
+    if evidence.is_empty() && !llm_text.trim().is_empty() {
+        evidence.push(truncate_with_ellipsis(llm_text.trim(), 180));
+    }
+
+    let mut uncertainties = Vec::new();
+    if llm_text.contains('?') {
+        uncertainties.push("Model still raises open questions.".to_string());
+    }
+    if !failures.is_empty() {
+        uncertainties.push("One or more tool calls failed this round.".to_string());
+    }
+    if uncertainties.is_empty() && evidence.is_empty() {
+        uncertainties.push("Insufficient evidence collected in this round.".to_string());
+    }
+
+    let mut next_plan = Vec::new();
+    if !failures.is_empty() {
+        next_plan.push("Avoid repeated failing calls; choose alternative tool path.".to_string());
+    }
+    if !evidence.is_empty() {
+        next_plan.push("Synthesize current evidence before adding more tool calls.".to_string());
+    }
+    if next_plan.is_empty() {
+        next_plan.push("Continue with targeted exploration on unresolved points.".to_string());
+    }
+
+    evidence.truncate(max_items);
+    uncertainties.truncate(max_items);
+    failures.truncate(max_items);
+    next_plan.truncate(max_items);
+
+    TrajectoryState {
+        round,
+        objective: truncate_with_ellipsis(objective, 180),
+        evidence,
+        uncertainties,
+        failures,
+        next_plan,
+        tool_calls: tool_calls.len(),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ToolLoopCancelled;
 
@@ -989,6 +1156,9 @@ pub(crate) async fn agent_turn(
         "channel",
         multimodal_config,
         max_tool_iterations,
+        true,
+        6,
+        8,
         None,
         None,
     )
@@ -1001,9 +1171,14 @@ async fn execute_one_tool(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
-) -> Result<String> {
+) -> Result<ToolExecutionRecord> {
     let Some(tool) = find_tool(tools_registry, call_name) else {
-        return Ok(format!("Unknown tool: {call_name}"));
+        return Ok(ToolExecutionRecord {
+            output: format!("Unknown tool: {call_name}"),
+            duration_ms: 0,
+            success: false,
+            error: Some("unknown_tool".to_string()),
+        });
     };
 
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -1023,24 +1198,42 @@ async fn execute_one_tool(
 
     match tool_result {
         Ok(r) => {
+            let duration = start.elapsed();
+            let success = r.success;
+            let output = if success {
+                scrub_credentials(&r.output)
+            } else {
+                format!("Error: {}", r.error.clone().unwrap_or_else(|| r.output.clone()))
+            };
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
-                duration: start.elapsed(),
-                success: r.success,
+                duration,
+                success,
             });
-            if r.success {
-                Ok(scrub_credentials(&r.output))
-            } else {
-                Ok(format!("Error: {}", r.error.unwrap_or_else(|| r.output)))
-            }
+            Ok(ToolExecutionRecord {
+                output,
+                duration_ms: duration.as_millis(),
+                success,
+                error: if success {
+                    None
+                } else {
+                    Some("tool_execution_failed".to_string())
+                },
+            })
         }
         Err(e) => {
+            let duration = start.elapsed();
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
-                duration: start.elapsed(),
+                duration,
                 success: false,
             });
-            Ok(format!("Error executing {call_name}: {e}"))
+            Ok(ToolExecutionRecord {
+                output: format!("Error executing {call_name}: {e}"),
+                duration_ms: duration.as_millis(),
+                success: false,
+                error: Some(e.to_string()),
+            })
         }
     }
 }
@@ -1069,7 +1262,7 @@ async fn execute_tools_parallel(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
-) -> Result<Vec<String>> {
+) -> Result<Vec<ToolExecutionRecord>> {
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|call| {
@@ -1094,8 +1287,8 @@ async fn execute_tools_sequential(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     cancellation_token: Option<&CancellationToken>,
-) -> Result<Vec<String>> {
-    let mut individual_results: Vec<String> = Vec::with_capacity(tool_calls.len());
+) -> Result<Vec<ToolExecutionRecord>> {
+    let mut individual_results: Vec<ToolExecutionRecord> = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
         if let Some(mgr) = approval {
@@ -1114,7 +1307,12 @@ async fn execute_tools_sequential(
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
 
                 if decision == ApprovalResponse::No {
-                    individual_results.push("Denied by user.".to_string());
+                    individual_results.push(ToolExecutionRecord {
+                        output: "Denied by user.".to_string(),
+                        duration_ms: 0,
+                        success: false,
+                        error: Some("denied_by_user".to_string()),
+                    });
                     continue;
                 }
             }
@@ -1162,20 +1360,78 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    trajectory_compression_enabled: bool,
+    trajectory_state_max_items: usize,
+    trajectory_max_rounds: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
-    let max_iterations = if max_tool_iterations == 0 {
+    let output = run_tool_call_loop_with_trace(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        multimodal_config,
+        max_tool_iterations,
+        trajectory_compression_enabled,
+        trajectory_state_max_items,
+        trajectory_max_rounds,
+        cancellation_token,
+        on_delta,
+    )
+    .await?;
+    Ok(output.response)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop_with_trace(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    trajectory_compression_enabled: bool,
+    trajectory_state_max_items: usize,
+    trajectory_max_rounds: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+) -> Result<ToolLoopOutput> {
+    let iteration_limit = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations
     };
+    let round_limit = if trajectory_max_rounds == 0 {
+        8
+    } else {
+        trajectory_max_rounds
+    };
+    let max_iterations = iteration_limit.min(round_limit);
+    let loop_started_at = Instant::now();
+    let mut trace_steps: Vec<AgentStepTrace> = Vec::new();
+    let mut trajectory_states: Vec<TrajectoryState> = Vec::new();
+    let objective = extract_objective(history);
+    let trajectory_enabled = trajectory_compression_enabled;
+    let trajectory_state_max_items = trajectory_state_max_items.max(1);
 
     let tool_specs: Vec<crate::tools::ToolSpec> =
         tools_registry.iter().map(|tool| tool.spec()).collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
-    for _iteration in 0..max_iterations {
+    for iteration in 0..max_iterations {
         if cancellation_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
@@ -1195,13 +1451,24 @@ pub(crate) async fn run_tool_call_loop(
             .into());
         }
 
+        let prepared_history: Vec<ChatMessage> = if trajectory_enabled {
+            if let Some(prev_state) = trajectory_states.last() {
+                let mut with_state = history.clone();
+                with_state.push(ChatMessage::system(trajectory_state_prompt_block(prev_state)));
+                with_state
+            } else {
+                history.clone()
+            }
+        } else {
+            history.clone()
+        };
         let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+            multimodal::prepare_messages_for_provider(&prepared_history, multimodal_config).await?;
 
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
-            messages_count: history.len(),
+            messages_count: prepared_history.len(),
         });
 
         let llm_started_at = Instant::now();
@@ -1235,10 +1502,11 @@ pub(crate) async fn run_tool_call_loop(
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match chat_result {
                 Ok(resp) => {
+                    let llm_duration = llm_started_at.elapsed();
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
                         model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
+                        duration: llm_duration,
                         success: true,
                         error_message: None,
                     });
@@ -1268,6 +1536,15 @@ pub(crate) async fn run_tool_call_loop(
                     };
 
                     let native_calls = resp.tool_calls;
+                    trace_steps.push(AgentStepTrace::LlmRequest {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        messages_count: prepared_history.len(),
+                        duration_ms: llm_duration.as_millis(),
+                        success: true,
+                        error: None,
+                        response_preview: Some(truncate_with_ellipsis(&response_text, 260)),
+                    });
                     (
                         response_text,
                         parsed_text,
@@ -1277,12 +1554,22 @@ pub(crate) async fn run_tool_call_loop(
                     )
                 }
                 Err(e) => {
+                    let llm_duration = llm_started_at.elapsed();
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
                         model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
+                        duration: llm_duration,
                         success: false,
                         error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                    });
+                    trace_steps.push(AgentStepTrace::LlmRequest {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        messages_count: prepared_history.len(),
+                        duration_ms: llm_duration.as_millis(),
+                        success: false,
+                        error: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                        response_preview: None,
                     });
                     return Err(e);
                 }
@@ -1321,7 +1608,15 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            return Ok(ToolLoopOutput {
+                response: display_text,
+                trace: AgentTrace {
+                    steps: trace_steps,
+                    total_duration_ms: loop_started_at.elapsed().as_millis(),
+                    iterations: iteration + 1,
+                    trajectory_states,
+                },
+            });
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
@@ -1361,8 +1656,27 @@ pub(crate) async fn run_tool_call_loop(
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, result
+                call.name, result.output
             );
+            trace_steps.push(AgentStepTrace::ToolCall {
+                tool: call.name.clone(),
+                arguments: call.arguments.clone(),
+                output_preview: truncate_with_ellipsis(&result.output, 260),
+                duration_ms: result.duration_ms,
+                success: result.success,
+                error: result.error.clone(),
+            });
+        }
+
+        if trajectory_enabled {
+            trajectory_states.push(build_trajectory_state(
+                iteration + 1,
+                &objective,
+                &display_text,
+                &tool_calls,
+                &individual_results,
+                trajectory_state_max_items,
+            ));
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -1376,7 +1690,7 @@ pub(crate) async fn run_tool_call_loop(
             for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
-                    "content": result,
+                    "content": result.output,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
@@ -1720,6 +2034,9 @@ pub async fn run(
             "cli",
             &config.multimodal,
             config.agent.max_tool_iterations,
+            config.agent.trajectory_compression_enabled,
+            config.agent.trajectory_state_max_items,
+            config.agent.trajectory_max_rounds,
             None,
             None,
         )
@@ -1839,6 +2156,9 @@ pub async fn run(
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                config.agent.trajectory_compression_enabled,
+                config.agent.trajectory_state_max_items,
+                config.agent.trajectory_max_rounds,
                 None,
                 None,
             )
@@ -1894,7 +2214,10 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-pub async fn process_message(config: Config, message: &str) -> Result<String> {
+pub async fn process_message_with_trace(
+    config: Config,
+    message: &str,
+) -> Result<ProcessMessageOutput> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -2054,7 +2377,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
-    agent_turn(
+    let output = run_tool_call_loop_with_trace(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -2063,10 +2386,25 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
         config.default_temperature,
         true,
+        None,
+        "channel",
         &config.multimodal,
         config.agent.max_tool_iterations,
+        config.agent.trajectory_compression_enabled,
+        config.agent.trajectory_state_max_items,
+        config.agent.trajectory_max_rounds,
+        None,
+        None,
     )
-    .await
+    .await?;
+    Ok(ProcessMessageOutput {
+        response: output.response,
+        trace: output.trace,
+    })
+}
+
+pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    Ok(process_message_with_trace(config, message).await?.response)
 }
 
 #[cfg(test)]
@@ -2309,6 +2647,9 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            true,
+            6,
+            8,
             None,
             None,
         )
@@ -2353,6 +2694,9 @@ mod tests {
             "cli",
             &multimodal,
             3,
+            true,
+            6,
+            8,
             None,
             None,
         )
@@ -2391,6 +2735,9 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            true,
+            6,
+            8,
             None,
             None,
         )
@@ -2511,6 +2858,9 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
+            true,
+            6,
+            8,
             None,
             None,
         )

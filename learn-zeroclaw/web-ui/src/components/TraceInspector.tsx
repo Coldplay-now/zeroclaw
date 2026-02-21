@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { AgentTrace, AgentStep } from "@/lib/api";
+import type { AgentTrace, AgentStep, TrajectoryState } from "@/lib/api";
 import {
   X,
   ChevronDown,
@@ -72,6 +72,18 @@ export function TraceInspector({ trace, model, onClose }: TraceInspectorProps) {
       {/* Timeline */}
       <ScrollArea className="flex-1">
         <div className="px-4 py-3">
+          {trace.trajectory_states && trace.trajectory_states.length > 0 && (
+            <>
+              <div className="text-xs font-medium text-muted-foreground mb-3 uppercase tracking-wider">
+                Trajectory States
+              </div>
+              <div className="space-y-2 mb-4">
+                {trace.trajectory_states.map((state) => (
+                  <TrajectoryStateCard key={state.round} state={state} />
+                ))}
+              </div>
+            </>
+          )}
           <div className="text-xs font-medium text-muted-foreground mb-3 uppercase tracking-wider">
             Timeline
           </div>
@@ -82,6 +94,37 @@ export function TraceInspector({ trace, model, onClose }: TraceInspectorProps) {
           </div>
         </div>
       </ScrollArea>
+    </div>
+  );
+}
+
+function TrajectoryStateCard({ state }: { state: TrajectoryState }) {
+  return (
+    <div className="border rounded-md p-3 space-y-1 text-xs">
+      <div className="font-medium">Round #{state.round}</div>
+      <DetailRow label="Objective" value={state.objective} />
+      <DetailRow label="Tool Calls" value={String(state.tool_calls)} />
+      <DetailRow
+        label="Evidence"
+        value={state.evidence.length > 0 ? state.evidence.join(" | ") : "n/a"}
+      />
+      <DetailRow
+        label="Uncertainties"
+        value={
+          state.uncertainties.length > 0
+            ? state.uncertainties.join(" | ")
+            : "n/a"
+        }
+      />
+      <DetailRow
+        label="Failures"
+        value={state.failures.length > 0 ? state.failures.join(" | ") : "n/a"}
+        isError={state.failures.length > 0}
+      />
+      <DetailRow
+        label="Next Plan"
+        value={state.next_plan.length > 0 ? state.next_plan.join(" | ") : "n/a"}
+      />
     </div>
   );
 }

@@ -55,10 +55,21 @@ export interface AgentStep {
   output_preview?: string;
 }
 
+export interface TrajectoryState {
+  round: number;
+  objective: string;
+  evidence: string[];
+  uncertainties: string[];
+  failures: string[];
+  next_plan: string[];
+  tool_calls: number;
+}
+
 export interface AgentTrace {
   steps: AgentStep[];
   total_duration_ms: number;
   iterations: number;
+  trajectory_states?: TrajectoryState[];
 }
 
 export interface MessageResponse {
@@ -508,7 +519,14 @@ export interface ConfigResponse {
   observability: { backend: string };
   gateway: { port: number; host: string; require_pairing: boolean };
   cost: { enabled: boolean; daily_limit_usd: number; monthly_limit_usd: number; warn_at_percent: number };
-  agent: { max_tool_iterations: number; max_history_messages: number; parallel_tools: boolean };
+  agent: {
+    max_tool_iterations: number;
+    max_history_messages: number;
+    parallel_tools: boolean;
+    trajectory_compression_enabled: boolean;
+    trajectory_state_max_items: number;
+    trajectory_max_rounds: number;
+  };
   channels_config: { message_timeout_secs: number };
   scheduler: { max_concurrent: number; max_tasks: number };
   reliability: { scheduler_poll_secs: number; scheduler_retries: number };

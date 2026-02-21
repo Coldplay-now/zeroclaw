@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 
 def read_jsonl(path):
@@ -44,6 +44,12 @@ def main():
     rows = read_jsonl(args.input)
     total = len(rows)
     success = sum(1 for r in rows if r.get("result", {}).get("ok") is True)
+    failure_counter = Counter()
+    category_counter = Counter()
+    for row in rows:
+        category_counter[row.get("category", "unknown")] += 1
+        if not row.get("result", {}).get("ok"):
+            failure_counter[row.get("result", {}).get("error") or "unknown"] += 1
 
     latency = [r.get("result", {}).get("latency_ms") for r in rows]
     iterations = [r.get("result", {}).get("iterations") for r in rows]
@@ -65,6 +71,11 @@ def main():
     lines.append(f"- P95 latency: {fmt_num(p95(latency))} ms")
     lines.append(f"- Avg iterations: {fmt_num(avg(iterations))}")
     lines.append(f"- Avg tool calls: {fmt_num(avg(tool_calls))}")
+    if failure_counter:
+        lines.append(
+            "- Failure distribution: "
+            + ", ".join(f"{k}={v}" for k, v in failure_counter.items())
+        )
     lines.append("")
     lines.append("## Per Task")
     lines.append("")
@@ -82,6 +93,14 @@ def main():
             f"| {task_id} | {t_total} | {fmt_num((t_success / t_total * 100) if t_total else None)} | "
             f"{fmt_num(avg(t_latency))} | {fmt_num(avg(t_iter))} | {fmt_num(avg(t_tools))} |"
         )
+
+    lines.append("")
+    lines.append("## Category Coverage")
+    lines.append("")
+    lines.append("| Category | Runs |")
+    lines.append("|---|---:|")
+    for category in sorted(category_counter.keys()):
+        lines.append(f"| {category} | {category_counter[category]} |")
 
     lines.append("")
     lines.append("## Notes")

@@ -1,0 +1,20 @@
+{"id":"smoke-001","category":"qa","prompt":"用三句话解释什么是 ZeroClaw，并给出一个适合新手的入门顺序。","expectation":"应提到 ZeroClaw 是 Agent Runtime，并包含清晰的入门步骤。"}
+{"id":"smoke-002","category":"planning","prompt":"给出一个本地运行 ZeroClaw（前后端）的最小排障清单，按优先级排序。","expectation":"应包含端口、健康检查、pair/token、日志检查等关键项。"}
+{"id":"smoke-003","category":"tools","prompt":"请为“将来引入 RE-TRAC”列出 5 个可量化指标，并说明每个指标的采集方式。","expectation":"指标需可量化，且包含采集口径。"}
+{"id":"smoke-004","category":"scheduler","prompt":"假设有一个每天 9 点执行的任务，说明如何验证它是否执行成功并发送到了 Telegram。","expectation":"应覆盖任务状态、运行记录、投递状态与失败重试。"}
+{"id":"smoke-005","category":"cost","prompt":"如何在不降低成功率的前提下减少工具调用次数？给出可执行策略。","expectation":"应给出去重、提前停止、失败熔断等策略。"}
+{"id":"baseline-006","category":"qa","prompt":"解释 ZeroClaw 中 Provider、Channel、Tool 三种抽象分别解决什么问题。","expectation":"应区分职责边界，避免混淆。"}
+{"id":"baseline-007","category":"planning","prompt":"把 RE-TRAC-lite 的 Phase A 开发拆成 6 个可提交的小步骤。","expectation":"应给出清晰顺序和提交粒度。"}
+{"id":"baseline-008","category":"tools","prompt":"如果 shell 工具连续失败 3 次，应该如何调整策略避免空转？","expectation":"应包含失败熔断与替代路径。"}
+{"id":"baseline-009","category":"ops","prompt":"请给出一份 ZeroClaw 本地服务日常巡检清单（含健康检查命令）。","expectation":"应包含后端、前端、日志、资源、鉴权检查。"}
+{"id":"baseline-010","category":"scheduler","prompt":"设计一个每小时巡检并汇总异常的 cron 任务模板。","expectation":"应包含触发频率、执行内容、异常处理。"}
+{"id":"baseline-011","category":"cost","prompt":"在保持准确率的前提下，给出 4 条降低 token 消耗的工程策略。","expectation":"应覆盖上下文控制、缓存、工具调用策略等。"}
+{"id":"baseline-012","category":"trace","prompt":"如何利用 trace 面板快速定位一次失败请求的根因？","expectation":"应提到步骤时间、错误字段、工具参数/输出。"}
+{"id":"baseline-013","category":"security","prompt":"说明 require_pairing 打开时，webhook 调用的最小认证流程。","expectation":"应提到 pair code、token、Authorization 头。"}
+{"id":"baseline-014","category":"tools","prompt":"当 memory_recall 返回噪声较多时，agent 应如何收敛到关键信息？","expectation":"应给出过滤、重试、关键词收敛策略。"}
+{"id":"baseline-015","category":"ops","prompt":"给出一个“后端健康 OK 但前端代理 FAIL”的排障流程。","expectation":"应覆盖 5173 代理、Vite、跨进程连通性检查。"}
+{"id":"baseline-016","category":"planning","prompt":"定义 RE-TRAC-lite 的验收标准，分功能与指标两个层级。","expectation":"应区分功能达标和指标达标。"}
+{"id":"baseline-017","category":"trace","prompt":"设计 trajectory state 的最小字段集，并说明每个字段用途。","expectation":"应包含 objective/evidence/uncertainties/failures/next_plan。"}
+{"id":"baseline-018","category":"scheduler","prompt":"如何验证一个定时任务是否发生了‘重复执行但结果相同’的问题？","expectation":"应包含 run history、输出比对、幂等性检查。"}
+{"id":"baseline-019","category":"security","prompt":"给出一套避免工具调用泄露敏感信息的策略。","expectation":"应提到输出脱敏、白名单、日志约束。"}
+{"id":"baseline-020","category":"cost","prompt":"如果 P95 延迟过高但平均延迟正常，你会优先看哪些指标？","expectation":"应聚焦长尾分析与重试/工具慢调用。"}

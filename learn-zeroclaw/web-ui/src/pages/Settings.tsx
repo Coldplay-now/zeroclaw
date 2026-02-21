@@ -262,6 +262,52 @@ export function Settings() {
             type="number"
             hint={t("rangeHint", { min: 10, max: 200 })}
           />
+          <SettingToggle
+            label={t("agentTrajectoryCompressionEnabled")}
+            checked={
+              draft.agent_trajectory_compression_enabled !== undefined
+                ? Boolean(draft.agent_trajectory_compression_enabled)
+                : config.agent.trajectory_compression_enabled
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                agent_trajectory_compression_enabled: v,
+              })
+            }
+          />
+          <SettingField
+            label={t("agentTrajectoryStateMaxItems")}
+            value={
+              draft.agent_trajectory_state_max_items !== undefined
+                ? String(draft.agent_trajectory_state_max_items)
+                : String(config.agent.trajectory_state_max_items)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                agent_trajectory_state_max_items: parseInt(v, 10) || 6,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 1, max: 20 })}
+          />
+          <SettingField
+            label={t("agentTrajectoryMaxRounds")}
+            value={
+              draft.agent_trajectory_max_rounds !== undefined
+                ? String(draft.agent_trajectory_max_rounds)
+                : String(config.agent.trajectory_max_rounds)
+            }
+            onChange={(v) =>
+              setDraft({
+                ...draft,
+                agent_trajectory_max_rounds: parseInt(v, 10) || 8,
+              })
+            }
+            type="number"
+            hint={t("rangeHint", { min: 1, max: 50 })}
+          />
           <SettingField
             label={t("channelsMessageTimeoutSecs")}
             value={
